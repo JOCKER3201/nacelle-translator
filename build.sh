@@ -50,6 +50,30 @@ fi
 }
 export CC="${CC:-clang}" CXX="${CXX:-clang++}"                # whisper.cpp (cmake)
 
+# Backend CUDA (whisper-rs feature "cuda", zawsze włączona w Cargo.toml) —
+# wymaga CUDA Toolkit (nvcc), dostępnego tylko w kontenerze budującym
+# (distrobox "Fedora"), nie na hoście Bazzite. Trzy rzeczy, które inaczej
+# trzeba by ustawiać ręcznie przed KAŻDYM buildem:
+CUDA_BIN="${CUDA_BIN:-/usr/local/cuda/bin}"
+if [[ -x "$CUDA_BIN/nvcc" ]]; then
+  case ":$PATH:" in *":$CUDA_BIN:"*) ;; *) export PATH="$CUDA_BIN:$PATH" ;; esac
+else
+  echo "błąd: brak nvcc w $CUDA_BIN — feature \"cuda\" (Cargo.toml) wymaga CUDA Toolkit." >&2
+  echo "  Uruchom w kontenerze z Toolkitem, np.: distrobox enter Fedora -- $0 ${*:-}" >&2
+  echo "  (albo ustaw CUDA_BIN na katalog z nvcc)" >&2
+  exit 1
+fi
+# nvcc bywa niekompatybilny z najnowszym systemowym gcc/g++ (np. Fedora
+# Rawhide w distroboxie "Fedora") — wymaga jawnie wskazanego, starszego
+# kompilatora hosta; g++-15 zweryfikowany jako działający z CUDA 13.3.
+if [[ -z "${CMAKE_CUDA_HOST_COMPILER:-}" ]]; then
+  for cxx in /usr/bin/g++-15 /usr/bin/g++-14 /usr/bin/g++-13; do
+    [[ -x "$cxx" ]] && { export CMAKE_CUDA_HOST_COMPILER="$cxx"; break; }
+  done
+fi
+export CMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCHITECTURES:-120}"  # RTX 5090 (Blackwell)
+echo "CUDA: nvcc=$CUDA_BIN/nvcc host-cc=${CMAKE_CUDA_HOST_COMPILER:-<auto>} arch=${CMAKE_CUDA_ARCHITECTURES}"
+
 if [[ "$CLEAN" == "1" ]]; then
   cargo clean
 fi

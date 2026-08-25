@@ -51,6 +51,13 @@ fi
 cp translator dist/bin/translator
 chmod 755 dist/bin/translator
 cp nacelle-translator.toml.example README.md dist/
+# rzeczywisty config (gitignored — engine=llamacpp, tuning VAD/TTS z tej
+# sesji) też do dist/, żeby instalacja miała działającą konfigurację, nie
+# tylko przykład wymagający ręcznego skopiowania
+if [[ -f nacelle-translator.toml ]]; then
+  cp nacelle-translator.toml dist/
+  echo "skopiowano: nacelle-translator.toml (Twoja konfiguracja) -> dist/"
+fi
 
 echo
 echo "gotowe: dist/ (binarka + ${#CUDA_LIB_NAMES[@]} biblioteki CUDA runtime)"
