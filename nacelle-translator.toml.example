@@ -30,7 +30,11 @@ hangover_ms = 800        # cisza kończąca wypowiedź (700-1000; za mało tnie 
 soft_hangover_ms = 250   # skrócony hangover po przekroczeniu soft_max_ms: szybka mowa
                          # robi między frazami pauzy 200-400ms — za krótkie na pełny
                          # hangover, a wystarczające na porządną granicę cięcia
-soft_max_ms = 3000       # od tej długości: (1) szukamy dołka do cięcia,
+dip_settle_ms = 500      # tnij w dołku p już po 0,7s od jego wystąpienia — bez czekania
+                         # na hard_max; klucz do niskiego opóźnienia przy ciągłej mowie
+dip_threshold = 0.6      # próg dołka dla tego cięcia — luźniejszy niż threshold_exit,
+                         # bo pod muzyką p nie schodzi nisko nawet na granicach fraz
+soft_max_ms = 2000       # od tej długości: (1) szukamy dołka do cięcia,
                          # (2) obowiązuje soft_hangover_ms zamiast hangover_ms
 hard_max_ms = 8000       # twarde cięcie ciągłej mowy — sufit awaryjny, gdy nie
                          # trafi się żadna pauza ani dołek
@@ -64,8 +68,10 @@ ollama_timeout_s = 60            # timeout dla silnika "ollama" (lokalny model b
 [tts]
 piper_bin = "~/.local/share/piper/piper/piper"
 voice = "~/.local/share/piper/pl_PL-gosia-medium.onnx"
-length_scale = 0.8               # <1.0 = szybsza mowa („lektorska"); polski tekst jest
+length_scale = 0.68             # <1.0 = szybsza mowa; agresywnie, bo TranslateGemma tłumaczy rozwlekle
+catchup_length_scale = 0.55      # tempo doganiania: gdy zadanie ma >2s zaległości (rozwlekłe
+                                 # tłumaczenie wydłużyło kolejkę), lektor chwilowo przyspiesza
                                  # dłuższy od angielskiego — lektor MUSI mówić szybciej
                                  # niż oryginał, inaczej kolejka odtwarzania stale rośnie
-sentence_silence = 0.1           # cisza po każdym zdaniu [s]
+sentence_silence = 0.05          # cisza po każdym zdaniu [s]
 work_dir = "/dev/shm/nacelle-translator-tts"  # tmpfs — zero realnego I/O

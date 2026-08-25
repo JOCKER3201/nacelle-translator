@@ -53,6 +53,15 @@ pub struct VadCfg {
     /// szybka mowa robi między frazami pauzy za krótkie na pełny hangover;
     /// bez tego wszystko czeka na twarde cięcie przy hard_max_ms
     pub soft_hangover_ms: u32,
+    /// ile ms musi minąć od najgłębszego dołka p, żeby uciąć segment w tym
+    /// dołku bez czekania na hard_max_ms — dla ciągłej mowy bez żadnych pauz
+    /// to główny mechanizm ograniczający opóźnienie pierwszego fragmentu
+    pub dip_settle_ms: u32,
+    /// próg "wystarczająco dobrego" dołka dla cięcia ustabilizowanego —
+    /// celowo LUŹNIEJSZY niż threshold_exit: przy mowie z podkładem
+    /// muzycznym Silero nie schodzi poniżej threshold_exit nawet na
+    /// granicach fraz, ale dołki 0.4-0.6 tam występują
+    pub dip_threshold: f32,
     pub soft_max_ms: u32,
     pub hard_max_ms: u32,
     pub overlap_ms: u32,
@@ -67,6 +76,8 @@ impl Default for VadCfg {
             min_speech_ms: 500,
             hangover_ms: 800,
             soft_hangover_ms: 250,
+            dip_settle_ms: 500,
+            dip_threshold: 0.6,
             soft_max_ms: 3_000,
             hard_max_ms: 8_000,
             overlap_ms: 250,
@@ -160,6 +171,11 @@ pub struct TtsCfg {
     pub voice: String,
     /// <1.0 = szybsza mowa (odwrotność "speed")
     pub length_scale: f32,
+    /// tempo lektora w trybie DOGANIANIA — używane, gdy zadanie ma już
+    /// sporą zaległość (rozwlekłe tłumaczenie wydłużyło kolejkę): lektor
+    /// chwilowo przyspiesza i nadgania, zamiast pozwalać zaległości dobić
+    /// do budżetu porzucania. Ustaw równe length_scale, żeby wyłączyć.
+    pub catchup_length_scale: f32,
     pub sentence_silence: f32,
     /// katalog roboczy na WAV-y pipera; tmpfs = zero realnego I/O
     pub work_dir: String,
@@ -171,6 +187,7 @@ impl Default for TtsCfg {
             piper_bin: "~/.local/share/piper/piper/piper".into(),
             voice: "~/.local/share/piper/pl_PL-gosia-medium.onnx".into(),
             length_scale: 0.9,
+            catchup_length_scale: 0.55,
             sentence_silence: 0.1,
             work_dir: "/dev/shm/nacelle-translator-tts".into(),
         }

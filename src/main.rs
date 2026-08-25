@@ -83,10 +83,12 @@ fn cmd_run(config_path: &PathBuf) -> Result<()> {
     let (cap_prod, cap_cons) = HeapRb::<f32>::new(pw::RATE as usize * 4).split(); // mono, 4 s
     let (mut pass_prod, pass_cons) =
         HeapRb::<f32>::new(pw::RATE as usize * pw::CHANNELS * 2).split(); // stereo, 2 s
-    // 8 s wystarcza na najdłuższy klip lektora; mniejszy ring + wąskie kanały
-    // w pipeline.rs (patrz MAX_JOB_AGE) trzymają opóźnienie E2E w ryzach
-    // zamiast pozwalać mu rosnąć bez ograniczeń przy gęstej mowie
-    let (tts_prod, tts_cons) = HeapRb::<f32>::new(pw::RATE as usize * 8).split(); // mono, 8 s
+    // Ring TTS to TWARDY limit zaległości lektora względem oryginału: wątek
+    // TTS wpycha klipy przyrostowo (pipeline.rs), więc klip dłuższy niż ring
+    // też przejdzie — ale nowa mowa lektora zacznie się najpóźniej ~5 s po
+    // zsyntetyzowaniu. Większy ring = dłuższe "doganianie" po serii
+    // rozwlekłych tłumaczeń (polski bywa ~10% dłuższy od angielskiego).
+    let (tts_prod, tts_cons) = HeapRb::<f32>::new(pw::RATE as usize * 3).split(); // mono, 3 s
 
     // luz na start toru passthrough (~85 ms), żeby odtwarzanie nie łapało
     // underrunów zanim sink zacznie produkować

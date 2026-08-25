@@ -131,7 +131,7 @@ const BLACKLIST: &[&str] = &[
     "do zobaczenia w następnym odcinku",
 ];
 
-fn normalize(s: &str) -> String {
+pub(crate) fn normalize(s: &str) -> String {
     s.to_lowercase()
         .chars()
         .filter(|c| c.is_alphanumeric() || c.is_whitespace())

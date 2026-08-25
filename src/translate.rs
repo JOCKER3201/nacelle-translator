@@ -437,9 +437,27 @@ impl Translator for LlamaCppTranslator {
             "en"
         };
 
+        // Prefiks promptu musi być append-only między resetami, żeby
+        // cache_prompt llama-servera trafiał: rolowanie okna (pop_front)
+        // zmieniało prefiks przy KAŻDEJ turze i wymuszało pełny reprocessing
+        // promptu. Pełny reset co context_pairs tur (jak łańcuch Gemini)
+        // kosztuje chwilową utratę kontekstu raz na kilka tur, ale między
+        // resetami prompt tylko rośnie i cache działa.
+        if self.history.len() >= self.cfg.context_pairs {
+            self.history.clear();
+        }
+
+        // n_predict proporcjonalny do wejścia zamiast globalnego max_tokens:
+        // na zniekształconej transkrypcji model potrafi halucynować rozdęte,
+        // wielokrotnie dłuższe "tłumaczenie" (obserwowane: 2s oryginału →
+        // 7.7s lektora), które zapycha kolejkę odtwarzania na wiele sekund.
+        // 4 tokeny na słowo wejścia + zapas to dużo nawet dla fleksyjnej
+        // polszczyzny — legalne tłumaczenia się mieszczą, rozdęcia są ucinane.
+        let input_words = text.split_whitespace().count() as u32;
+        let n_predict = (input_words * 4 + 24).min(self.cfg.max_tokens);
         let body = json!({
             "prompt": self.build_prompt(src_code, text),
-            "n_predict": self.cfg.max_tokens,
+            "n_predict": n_predict,
             "temperature": 0.0,
             "stream": false,
             "cache_prompt": true,
@@ -461,9 +479,6 @@ impl Translator for LlamaCppTranslator {
 
         self.history
             .push_back((src_code.to_string(), text.to_string(), translated.clone()));
-        while self.history.len() > self.cfg.context_pairs {
-            self.history.pop_front();
-        }
         Ok(translated)
     }
 }

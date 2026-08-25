@@ -33,14 +33,21 @@ const COALESCE_GAP_SAMPLES: usize = VAD_RATE * 3 / 10; // 0.3 s
 const SILENCE_INJECT_AFTER: Duration = Duration::from_millis(200);
 /// zadanie starsze niż to (liczone od zamknięcia segmentu przez VAD) jest
 /// porzucane zamiast płynąć dalej przez STT/MT/TTS — inaczej opóźnienie
-/// rośnie bez ograniczeń, a lektor czyta treść sprzed minut zamiast bieżącej
-const MAX_JOB_AGE: Duration = Duration::from_secs(18);
+/// rośnie bez ograniczeń, a lektor czyta treść sprzed minut zamiast bieżącej.
+/// Krótki budżet = zachowanie tłumacza symultanicznego: przy chwilowym
+/// przeciążeniu gubimy fragment i wracamy do NA ŻYWO, zamiast wiernie
+/// odczytywać rosnącą zaległość
+const MAX_JOB_AGE: Duration = Duration::from_secs(8);
 
 struct SttJob {
     id: u64,
     created: Instant,
     audio: Vec<f32>,
     coalesced: usize,
+    /// segment ucięty w trakcie mowy (dołek/hard-max) — następny segment
+    /// zaczyna się nakładką powielającą koniec tego; podstawa deduplikacji
+    /// szwu w stt_thread
+    forced: bool,
 }
 
 struct MtJob {
@@ -48,12 +55,16 @@ struct MtJob {
     created: Instant,
     text: String,
     lang: String,
+    /// długość oryginalnego audio segmentu [s] — do wykrywania rozdętych
+    /// tłumaczeń w tts_thread
+    orig_secs: f32,
 }
 
 struct TtsJob {
     id: u64,
     created: Instant,
     text: String,
+    orig_secs: f32,
 }
 
 /// Wysyła nazwę wątku przy zakończeniu (Drop biegnie i po zwykłym return,
@@ -80,6 +91,11 @@ pub fn spawn(
     let transcriber = Transcriber::new(&cfg.stt_model(), cfg.stt.threads, &cfg.stt.language)?;
     let translator = translate::make_translator(&cfg.translate)?;
     let piper = PiperTts::spawn(&cfg.tts, &cfg.piper_bin(), &cfg.piper_voice())?;
+    // drugi piper w tempie doganiania — patrz tts_thread; oba procesy
+    // startują tutaj (fail-fast), synteza i tak jest szeregowa w jednym wątku
+    let mut fast_cfg = cfg.tts.clone();
+    fast_cfg.length_scale = cfg.tts.catchup_length_scale;
+    let piper_fast = PiperTts::spawn(&fast_cfg, &cfg.piper_bin(), &cfg.piper_voice())?;
     let vad = VoiceActivityDetector::builder()
         .sample_rate(VAD_RATE as i64)
         .chunk_size(VAD_CHUNK)
@@ -128,7 +144,9 @@ pub fn spawn(
     };
     std::thread::Builder::new().name("tts".into()).spawn(move || {
         let _health = health;
-        tts_thread(piper, tts_cfg, piper_bin, piper_voice, tts_rx, tts_prod);
+        tts_thread(
+            piper, piper_fast, tts_cfg, fast_cfg, piper_bin, piper_voice, tts_rx, tts_prod,
+        );
     })?;
 
     Ok(health_rx)
@@ -140,7 +158,9 @@ fn segmenter_thread(
     vad_cfg: crate::config::VadCfg,
     seg_tx: chan::Sender<SttJob>,
 ) {
-    let mut resampler = match StreamResampler::new(crate::pw::RATE as usize, VAD_RATE, 1024) {
+    // chunk 256 zamiast 1024: batching wejścia 5 ms zamiast 21 ms — mniejsze
+    // stałe opóźnienie frontu toru analizy przy pomijalnym koszcie CPU
+    let mut resampler = match StreamResampler::new(crate::pw::RATE as usize, VAD_RATE, 256) {
         Ok(r) => r,
         Err(e) => {
             log::error!("segmenter: nie mogę utworzyć resamplera: {e:#}");
@@ -194,19 +214,30 @@ fn segmenter_thread(
             chunk.copy_from_slice(&pcm16k[..VAD_CHUNK]);
             pcm16k.drain(..VAD_CHUNK);
             let p = vad.predict(chunk.iter().copied());
-            if let Some(utt) = segmenter.push_chunk(&chunk, p) {
+            let was_idle = segmenter.is_idle();
+            let closed = segmenter.push_chunk(&chunk, p);
+            // otwarcie wypowiedzi — bez tego log nie pokazuje fałszywych
+            // wyzwoleń VAD na muzyce w scenach bez dialogu
+            if was_idle && !segmenter.is_idle() {
+                log::info!("#{next_id} start mowy (p={p:.2})");
+            }
+            if let Some(utt) = closed {
                 let id = next_id;
                 next_id += 1;
                 let secs = utt.audio.len() as f32 / VAD_RATE as f32;
                 log::info!(
-                    "#{id} segment zamknięty: {secs:.1}s{}",
-                    if utt.forced { " (cięcie twarde — mowa trwa dalej)" } else { "" }
+                    "#{id} segment zamknięty: {secs:.1}s (powód: {}, p̄={:.2}, pmin={:.2}){}",
+                    utt.reason.label(),
+                    utt.p_mean,
+                    utt.p_min,
+                    if utt.forced { " — mowa trwa dalej" } else { "" }
                 );
                 let job = SttJob {
                     id,
                     created: Instant::now(),
                     audio: utt.audio,
                     coalesced: 1,
+                    forced: utt.forced,
                 };
                 if seg_tx.try_send(job).is_err() {
                     dropped += 1;
@@ -227,16 +258,39 @@ fn stt_thread(
 ) {
     let mut transcriber = transcriber;
     let mut filter = HallucinationFilter::new();
-    while let Ok(mut job) = seg_rx.recv() {
-        // sklejamy zaległe segmenty — jeden call whispera zamiast kolejki
-        while job.audio.len() < COALESCE_MAX_SAMPLES {
+    // ostatni ZAAKCEPTOWANY segment: (id, znormalizowane ostatnie słowo,
+    // czy był ucięty w trakcie mowy i niesklejony) — do deduplikacji szwu
+    let mut prev_seam: Option<(u64, String, bool)> = None;
+    // segment, który nie zmieścił się w limicie sklejania — przetwarzany
+    // w następnym obiegu zamiast przepaść (try_recv już zdjął go z kanału)
+    let mut pending: Option<SttJob> = None;
+    loop {
+        let mut job = match pending.take() {
+            Some(j) => j,
+            None => match seg_rx.recv() {
+                Ok(j) => j,
+                Err(_) => break,
+            },
+        };
+        // sklejamy zaległe segmenty — jeden call whispera zamiast kolejki.
+        // Limit sprawdzany PO doklejeniu: whisper z single_segment dekoduje
+        // jedno okno 30 s, więc sklejka ponad COALESCE_MAX_SAMPLES cicho
+        // gubiłaby wszystko powyżej okna
+        loop {
             match seg_rx.try_recv() {
                 Ok(next) => {
+                    if job.audio.len() + COALESCE_GAP_SAMPLES + next.audio.len()
+                        > COALESCE_MAX_SAMPLES
+                    {
+                        pending = Some(next);
+                        break;
+                    }
                     job.audio.extend(std::iter::repeat(0.0).take(COALESCE_GAP_SAMPLES));
                     job.audio.extend_from_slice(&next.audio);
                     job.id = next.id; // raportujemy najnowszy
                     job.created = next.created;
                     job.coalesced += next.coalesced;
+                    job.forced = next.forced;
                 }
                 Err(_) => break,
             }
@@ -258,7 +312,7 @@ fn stt_thread(
 
         let secs = job.audio.len() as f32 / VAD_RATE as f32;
         let t0 = Instant::now();
-        let t = match transcriber.transcribe(&job.audio) {
+        let mut t = match transcriber.transcribe(&job.audio) {
             Ok(t) => t,
             Err(e) => {
                 log::error!("#{} whisper: {e:#}", job.id);
@@ -280,11 +334,51 @@ fn stt_thread(
             );
             continue;
         }
+        // Deduplikacja szwu: po cięciu wymuszonym nakładka 250 ms powiela
+        // ostatnie słowo poprzedniego segmentu ("...but until" → "Until we...").
+        // Twarde bramki (werdykt weryfikacji floty): tylko bezpośrednio
+        // kolejne id, oba segmenty niesklejone, poprzedni ucięty w trakcie
+        // mowy, zdejmowane najwyżej JEDNO słowo — duplikat jest tańszy niż
+        // zgubione słowo, więc przy jakiejkolwiek wątpliwości nie zdejmujemy.
+        if let Some((pid, last_w, seam_ok)) = &prev_seam {
+            if *seam_ok && job.id == *pid + 1 && job.coalesced == 1 {
+                if let Some(first_w) = t.text.split_whitespace().next() {
+                    if !last_w.is_empty() && crate::stt::normalize(first_w) == *last_w {
+                        let cut_from =
+                            t.text.find(first_w).unwrap_or(0) + first_w.len();
+                        let rest = t.text[cut_from..].trim_start().to_string();
+                        log::info!(
+                            "#{} szew: zdjęto powtórzone \"{first_w}\" z nakładki",
+                            job.id
+                        );
+                        t.text = rest;
+                    }
+                }
+            }
+        }
+        if t.text.is_empty() {
+            prev_seam = None;
+            continue;
+        }
+        prev_seam = Some((
+            job.id,
+            t.text
+                .split_whitespace()
+                .last()
+                .map(crate::stt::normalize)
+                .unwrap_or_default(),
+            job.forced && job.coalesced == 1,
+        ));
+        // no_speech/logprob także dla ZAAKCEPTOWANYCH — bez tego nie da się
+        // z logu ocenić, czy przepuszczone śmieci były "pewne" (filtr
+        // bezradny) czy graniczne (progi do stroju)
         log::info!(
-            "#{} 🗣 [{}] \"{}\" ({secs:.1}s audio, stt {ms} ms)",
+            "#{} 🗣 [{}] \"{}\" ({secs:.1}s audio, stt {ms} ms, no_speech {:.2}, logprob {:.2})",
             job.id,
             t.lang,
-            t.text
+            t.text,
+            t.no_speech_prob,
+            t.avg_logprob
         );
 
         if mt_cfg.skip_target_lang && t.lang == mt_cfg.target_lang_code {
@@ -296,6 +390,7 @@ fn stt_thread(
             created: job.created,
             text: t.text,
             lang: t.lang,
+            orig_secs: secs,
         });
     }
 }
@@ -330,6 +425,7 @@ fn translate_thread(
                     id: job.id,
                     created: job.created,
                     text: translated,
+                    orig_secs: job.orig_secs,
                 });
             }
             Err(e) => log::warn!("#{} tłumaczenie pominięte: {e:#}", job.id),
@@ -337,9 +433,53 @@ fn translate_thread(
     }
 }
 
+/// Zadanie z zaległością powyżej tego progu jest syntetyzowane w tempie
+/// doganiania (catchup_length_scale) — lektor chwilowo przyspiesza, żeby
+/// spłacić dług kolejki po rozwlekłym tłumaczeniu, zamiast pozwalać
+/// zaległości urosnąć do budżetu porzucania (MAX_JOB_AGE).
+const CATCHUP_AFTER: Duration = Duration::from_secs(1);
+
+/// Synteza z jedną próbą restartu procesu pipera po awarii (crash/OOM) —
+/// bez restartu synteza byłaby martwa do końca życia programu.
+fn synth_with_restart(
+    piper: &mut PiperTts,
+    cfg: &crate::config::TtsCfg,
+    piper_bin: &PathBuf,
+    piper_voice: &PathBuf,
+    id: u64,
+    text: &str,
+) -> Option<Vec<f32>> {
+    match piper.synthesize(text) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            log::error!("#{id} piper: {e:#} — próbuję zrestartować proces");
+            match PiperTts::spawn(cfg, piper_bin, piper_voice) {
+                Ok(fresh) => {
+                    *piper = fresh;
+                    match piper.synthesize(text) {
+                        Ok(c) => Some(c),
+                        Err(e2) => {
+                            log::error!("#{id} piper po restarcie nadal błąd: {e2:#} — pomijam");
+                            None
+                        }
+                    }
+                }
+                Err(spawn_err) => {
+                    log::error!("nie mogę zrestartować pipera: {spawn_err:#} — pomijam #{id}");
+                    std::thread::sleep(Duration::from_secs(3));
+                    None
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn tts_thread(
     mut piper: PiperTts,
+    mut piper_fast: PiperTts,
     cfg: crate::config::TtsCfg,
+    fast_cfg: crate::config::TtsCfg,
     piper_bin: PathBuf,
     piper_voice: PathBuf,
     tts_rx: chan::Receiver<TtsJob>,
@@ -366,31 +506,25 @@ fn tts_thread(
             continue;
         }
 
+        // Rozdęte tłumaczenie (dużo więcej znaków, niż oryginał zdołałby
+        // wypowiedzieć — typowy owoc halucynacji MT na zniekształconej
+        // transkrypcji) idzie w tempie doganiania NIEZALEŻNIE od zaległości:
+        // normalne tempo przy ~20 zn/s odtwarzania oznacza, że taki klip
+        // sam z siebie tworzy kilkusekundowy dług.
+        let oversized =
+            job.text.chars().count() as f32 / job.orig_secs.max(0.5) > 30.0;
+        let behind = age > CATCHUP_AFTER || oversized;
         let t0 = Instant::now();
-        let clip = match piper.synthesize(&job.text) {
-            Ok(c) => c,
-            Err(e) => {
-                // Proces pipera padł (crash/OOM) — bez restartu synteza
-                // byłaby martwa do końca życia programu. Jedna próba
-                // ponownego uruchomienia i powtórzenia tego zadania.
-                log::error!("#{} piper: {e:#} — próbuję zrestartować proces", job.id);
-                match PiperTts::spawn(&cfg, &piper_bin, &piper_voice) {
-                    Ok(fresh) => {
-                        piper = fresh;
-                        match piper.synthesize(&job.text) {
-                            Ok(c) => c,
-                            Err(e2) => {
-                                log::error!("#{} piper po restarcie nadal błąd: {e2:#} — pomijam", job.id);
-                                continue;
-                            }
-                        }
-                    }
-                    Err(spawn_err) => {
-                        log::error!("nie mogę zrestartować pipera: {spawn_err:#} — pomijam #{}", job.id);
-                        std::thread::sleep(Duration::from_secs(3));
-                        continue;
-                    }
-                }
+        let clip = {
+            let (active, active_cfg) = if behind {
+                (&mut piper_fast, &fast_cfg)
+            } else {
+                (&mut piper, &cfg)
+            };
+            match synth_with_restart(active, active_cfg, &piper_bin, &piper_voice, job.id, &job.text)
+            {
+                Some(c) => c,
+                None => continue,
             }
         };
         let clip48 = match upsampler.resample(&clip) {
@@ -400,11 +534,17 @@ fn tts_thread(
                 continue;
             }
         };
+        // wiek = pełne opóźnienie toru od zamknięcia segmentu do gotowej
+        // syntezy — jedna liczba mówiąca, czy problem leży w etapach AI
+        // (wiek mały) czy w kolejce odtwarzania (wiek rośnie z segmentu
+        // na segment)
         log::info!(
-            "#{} 🔊 {:.1}s mowy lektora (tts {} ms)",
+            "#{} 🔊 {:.1}s mowy lektora (tts {} ms, wiek {:.1}s{})",
             job.id,
             clip48.len() as f32 / crate::pw::RATE as f32,
-            t0.elapsed().as_millis()
+            t0.elapsed().as_millis(),
+            job.created.elapsed().as_secs_f32(),
+            if behind { ", tryb doganiania" } else { "" }
         );
         // push z czekaniem — ring daje naturalny backpressure
         let mut rest = &clip48[..];
