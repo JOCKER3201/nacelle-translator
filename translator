@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # translator — uruchamia cały stos jednym poleceniem: llama-server (silnik
-# tłumaczenia, w tle, wyciszony) + nacelle-translator (pierwszy plan, logi
-# w terminalu). Argumenty lecą do nacelle-translator (run/devices/check, -v).
-# Ctrl+C kończy oba; jeśli llama-server już działa, używany jest istniejący.
+# tłumaczenia, w tle) + nacelle-translator (pierwszy plan). Argumenty lecą
+# do nacelle-translator (run/devices/check, -v). Ctrl+C kończy oba; jeśli
+# llama-server już działa, używany jest istniejący (bez logowania go —
+# nie mamy dostępu do jego strumieni).
+#
+# Logi: każde uruchomienie zapisuje pełny wydruk obu procesów do
+# ~/.log/nacelle-translator/{llama-server,nacelle-translator}-DATA_GODZINA.log
+# (katalog tworzony automatycznie, jeśli nie istnieje) — i jednocześnie
+# wyświetla to samo na bieżąco w terminale (tee), tak jak bez logowania.
 #
 # Działa z obu układów katalogów:
 #   /opt/nacelle-translator/bin/translator   (po sudo make install)
@@ -23,6 +29,10 @@ fi
 # względne ścieżki (models/, nacelle-translator.toml) rozwiązują się od ROOT
 cd "$ROOT"
 
+LOG_DIR="$HOME/.log/nacelle-translator"
+mkdir -p "$LOG_DIR"
+TS="$(date +%Y-%m-%d_%H-%M-%S)"
+
 HOST="${TRANSLATOR_LLAMA_HOST:-http://localhost:8080}"
 PORT="${HOST##*:}"
 
@@ -35,7 +45,7 @@ cleanup() {
 trap cleanup EXIT
 
 if curl -sf "$HOST/health" >/dev/null 2>&1; then
-  echo "translator: llama-server już działa ($HOST) — używam istniejącego"
+  echo "translator: llama-server już działa ($HOST) — używam istniejącego (bez logu, nie startowałem go)"
 else
   MODEL="${TRANSLATOR_GGUF:-}"
   if [[ -z "$MODEL" ]]; then
@@ -45,24 +55,30 @@ else
     echo "translator: brak modelu GGUF w $ROOT/models/ (albo ustaw TRANSLATOR_GGUF=ścieżka)" >&2
     exit 1
   }
+  LLAMA_LOG="$LOG_DIR/llama-server-${TS}.log"
   echo "translator: startuję llama-server ($(basename "$MODEL"), port $PORT)"
-  "$BIN/llama-server" -m "$MODEL" --port "$PORT" --no-jinja >/dev/null 2>&1 &
+  echo "translator: log -> $LLAMA_LOG"
+  # >(tee ...) zamiast potoku |, żeby $! dalej wskazywało na sam
+  # llama-server (potrzebne do kill w cleanup), nie na proces tee
+  stdbuf -oL -eL "$BIN/llama-server" -m "$MODEL" --port "$PORT" --no-jinja \
+    > >(tee -a "$LLAMA_LOG") 2>&1 &
   started_pid=$!
   ok=""
   for _ in $(seq 1 120); do
     if curl -sf "$HOST/health" >/dev/null 2>&1; then ok=1; break; fi
     kill -0 "$started_pid" 2>/dev/null || {
-      echo "translator: llama-server zakończył się przy starcie — uruchom go ręcznie, żeby zobaczyć błąd:" >&2
-      echo "  $BIN/llama-server -m $MODEL --port $PORT --no-jinja" >&2
+      echo "translator: llama-server zakończył się przy starcie — log: $LLAMA_LOG" >&2
       exit 1
     }
     sleep 0.5
   done
   [[ -n "$ok" ]] || {
-    echo "translator: llama-server nie odpowiada po 60 s" >&2
+    echo "translator: llama-server nie odpowiada po 60 s — log: $LLAMA_LOG" >&2
     exit 1
   }
   echo "translator: llama-server gotowy"
 fi
 
-"$BIN/nacelle-translator" "$@"
+NACELLE_LOG="$LOG_DIR/nacelle-translator-${TS}.log"
+echo "translator: log -> $NACELLE_LOG"
+"$BIN/nacelle-translator" "$@" 2>&1 | tee -a "$NACELLE_LOG"
