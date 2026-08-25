@@ -1,0 +1,7 @@
+# RPATH $ORIGIN/../lib — pozwala binarce znaleźć dołączone biblioteki CUDA
+# runtime (libcudart/libcublas/libcublasLt, patrz package.sh) w katalogu
+# lib/ obok bin/ po instalacji do /opt/nacelle-translator, bez potrzeby CUDA
+# Toolkit ani LD_LIBRARY_PATH na hoście. Nieszkodliwe dla buildów bez
+# feature "cuda" — po prostu nieużywana ścieżka wyszukiwania.
+[build]
+rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN/../lib"]

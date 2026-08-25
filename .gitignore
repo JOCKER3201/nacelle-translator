@@ -1,0 +1,6 @@
+/target
+/models
+/dist
+/llama.cpp
+nacelle-translator.toml
+*.wav
