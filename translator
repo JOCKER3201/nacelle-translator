@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# translator — uruchamia cały stos jednym poleceniem: llama-server (silnik
+# tłumaczenia, w tle, wyciszony) + nacelle-translator (pierwszy plan, logi
+# w terminalu). Argumenty lecą do nacelle-translator (run/devices/check, -v).
+# Ctrl+C kończy oba; jeśli llama-server już działa, używany jest istniejący.
+#
+# Działa z obu układów katalogów:
+#   /opt/nacelle-translator/bin/translator   (po sudo make install)
+#   <repo>/translator                        (w repozytorium, po ./package.sh)
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ -x "$DIR/nacelle-translator" ]]; then
+  ROOT="$(dirname "$DIR")"   # układ zainstalowany: bin/ + lib/ + models/
+  BIN="$DIR"
+elif [[ -x "$DIR/dist/bin/nacelle-translator" ]]; then
+  ROOT="$DIR"                # układ repozytorium
+  BIN="$DIR/dist/bin"
+else
+  echo "translator: nie znajduję binarki nacelle-translator (najpierw build+package albo make install)" >&2
+  exit 1
+fi
+# względne ścieżki (models/, nacelle-translator.toml) rozwiązują się od ROOT
+cd "$ROOT"
+
+HOST="${TRANSLATOR_LLAMA_HOST:-http://localhost:8080}"
+PORT="${HOST##*:}"
+
+started_pid=""
+cleanup() {
+  if [[ -n "$started_pid" ]] && kill -0 "$started_pid" 2>/dev/null; then
+    kill "$started_pid" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+if curl -sf "$HOST/health" >/dev/null 2>&1; then
+  echo "translator: llama-server już działa ($HOST) — używam istniejącego"
+else
+  MODEL="${TRANSLATOR_GGUF:-}"
+  if [[ -z "$MODEL" ]]; then
+    MODEL="$(ls "$ROOT"/models/*.gguf 2>/dev/null | head -1 || true)"
+  fi
+  [[ -n "$MODEL" && -f "$MODEL" ]] || {
+    echo "translator: brak modelu GGUF w $ROOT/models/ (albo ustaw TRANSLATOR_GGUF=ścieżka)" >&2
+    exit 1
+  }
+  echo "translator: startuję llama-server ($(basename "$MODEL"), port $PORT)"
+  "$BIN/llama-server" -m "$MODEL" --port "$PORT" --no-jinja >/dev/null 2>&1 &
+  started_pid=$!
+  ok=""
+  for _ in $(seq 1 120); do
+    if curl -sf "$HOST/health" >/dev/null 2>&1; then ok=1; break; fi
+    kill -0 "$started_pid" 2>/dev/null || {
+      echo "translator: llama-server zakończył się przy starcie — uruchom go ręcznie, żeby zobaczyć błąd:" >&2
+      echo "  $BIN/llama-server -m $MODEL --port $PORT --no-jinja" >&2
+      exit 1
+    }
+    sleep 0.5
+  done
+  [[ -n "$ok" ]] || {
+    echo "translator: llama-server nie odpowiada po 60 s" >&2
+    exit 1
+  }
+  echo "translator: llama-server gotowy"
+fi
+
+"$BIN/nacelle-translator" "$@"

@@ -46,6 +46,10 @@ if [[ -f "$LLAMA_SERVER" ]]; then
 else
   echo "uwaga: brak $LLAMA_SERVER — dist/ bez silnika llamacpp (patrz README)" >&2
 fi
+# launcher całego stosu (llama-server w tle + nacelle-translator) — trafia
+# do bin/ obok binarek, bez rozszerzenia
+cp translator dist/bin/translator
+chmod 755 dist/bin/translator
 cp nacelle-translator.toml.example README.md dist/
 
 echo

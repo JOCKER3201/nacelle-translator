@@ -117,7 +117,8 @@ znalazła bez `LD_LIBRARY_PATH` i bez instalowania czegokolwiek na hoście.
 biblioteka, której się celowo NIE dołącza.
 
 ```sh
-sudo make install     # kopiuje dist/ do /opt/nacelle-translator (bin/ + lib/)
+sudo make install     # kopiuje dist/ + models/ do /opt/nacelle-translator (bin/, lib/, models/);
+                      # usuwa ./target przed i po instalacji
 sudo make uninstall
 ```
 
