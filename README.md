@@ -32,12 +32,14 @@ aplikacje ──▶ [Nacelle Translator (PL)]  (wirtualny sink, media.class=Audi
   model wielojęzyczny, autodetekcja języka źródłowego). Wymaga CUDA Toolkit
   w środowisku budowania (patrz „Budowanie z CUDA" niżej) — na hoście
   wystarczy sam sterownik NVIDIA.
-- **MT:** domyślnie **`engine = "llamacpp"`** — lokalny `llama-server` na
-  GPU serwujący model **TranslateGemma-4B-IT** (GGUF, dedykowany model
-  tłumaczeniowy Google, nie ogólny czat), wybrany bo mieści się w kilku GB
-  VRAM i zostawia miejsce na jednoczesne granie na tym samym GPU. Alternatywy:
-  **Gemini** (`engine = "gemini"`, API w chmurze, klucz w `GEMINI_API_KEY`),
-  **Ollama** (`engine = "ollama"`, `http://localhost:11434`, model w
+- **MT:** zalecany silnik to **`engine = "llamacpp"`** (ustaw w
+  `nacelle-translator.toml`) — lokalny `llama-server` na GPU serwujący model
+  **TranslateGemma-4B-IT** (GGUF, dedykowany model tłumaczeniowy Google, nie
+  ogólny czat), wybrany bo mieści się w kilku GB VRAM i zostawia miejsce na
+  jednoczesne granie na tym samym GPU. Uwaga: domyślną wartością w kodzie
+  (gdy nie ma pliku konfiguracyjnego) jest `"gemini"` — API w chmurze
+  (klucz w `GEMINI_API_KEY`), które działa bez lokalnego serwera. Pozostałe
+  silniki: **Ollama** (`engine = "ollama"`, `http://localhost:11434`, model w
   `ollama_model` — lokalnie na CPU, zbyt wolne na dużych wagach), **API
   Claude** (`engine = "claude"`, Messages API, klucz w `ANTHROPIC_API_KEY`)
   albo `"off"` do testu samego toru audio.
@@ -65,14 +67,15 @@ Wszystko poza modelem whispera już jest na tym systemie:
 - Rust, cmake, clang/libclang — z Homebrew,
 - piper + polski głos w `~/.local/share/piper` (binarka ma RUNPATH=$ORIGIN,
   żadnych zmiennych środowiskowych nie trzeba),
-- domyślny silnik `"llamacpp"` wymaga działającego `llama-server`
+- zalecany silnik `"llamacpp"` wymaga działającego `llama-server`
   (`llamacpp_host`, domyślnie `http://localhost:8080`) — patrz „Budowanie z
-  CUDA" niżej; silnik `"ollama"` wymaga działającej usługi
-  (`systemctl status ollama`) z modelem wskazanym w `ollama_model`
-  (domyślnie `gemma`); silnik `"gemini"` wymaga `export GEMINI_API_KEY=...`
-  (Google AI Studio); silnik `"claude"` wymaga `export ANTHROPIC_API_KEY=...`
-  — `nacelle-translator check` sprawdza dokładnie ten silnik, który masz ustawiony
-  w `[translate] engine`,
+  CUDA" niżej; silnik `"gemini"` (domyślny w kodzie, gdy brak pliku
+  konfiguracyjnego) wymaga `export GEMINI_API_KEY=...` (Google AI Studio);
+  silnik `"ollama"` wymaga działającej usługi (`systemctl status ollama`)
+  z modelem wskazanym w `ollama_model` (domyślnie `gemma`); silnik
+  `"claude"` wymaga `export ANTHROPIC_API_KEY=...` — `nacelle-translator
+  check` sprawdza dokładnie ten silnik, który masz ustawiony w
+  `[translate] engine`,
 - model whispera (jednorazowo, ~488 MB):
 
 ```sh
