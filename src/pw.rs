@@ -1,37 +1,72 @@
-//! Graf PipeWire: wirtualny sink (media.class=Audio/Sink) + strumień
-//! odtwarzania wycelowany w sprzętowe urządzenie. Callbacki RT wymieniają
-//! próbki z resztą programu wyłącznie przez lock-free ringbuffery SPSC.
+//! Graf PipeWire: PRZELOTKA w torze dźwięku — wirtualny sink
+//! (media.class=Audio/Sink) plus strumień odtwarzania, oba w jednej grupie
+//! `node.link-group`, zgłoszone WirePlumberowi jako inteligentny filtr
+//! (`filter.smart`). Callbacki RT wymieniają próbki z resztą programu
+//! wyłącznie przez lock-free ringbuffery SPSC.
 //!
-//! Ochrona przed pętlą (gdy nasz sink jest domyślnym urządzeniem). Opis stanu
-//! FAKTYCZNEGO, sprawdzonego w źródłach WirePlumbera 0.5.12 na tej maszynie —
-//! nie deklaracji:
-//!  1. `target.object` = node.name sprzętu RAZEM z `node.dont-fallback=true`.
-//!     Sam `target.object` nie blokuje NICZEGO: gdy dopasowanie nie trafi,
-//!     linking/find-defined-target.lua:82-94 zostawia `target_picked=false`
-//!     i oddaje sterowanie dalej, aż do linking/find-default-target.lua,
-//!     czyli do domyślnego sinka — a tym może być NASZ sink. Dopiero
-//!     `node.dont-fallback` (czytane w find-defined-target.lua:38 wprost
-//!     z właściwości węzła; to klucz WirePlumbera, PipeWire go nie zna)
-//!     włącza gałąź :116-127: `sendClientError` + `node:request_destroy()`
-//!     + `event:stop_processing()` — czyli ucina jakikolwiek fallback
-//!     i zamienia cichy zawis w głośny błąd. Świadomy koszt: przejściowa
-//!     nieobecność celu (przełączanie profilu karty, uśpienie słuchawek)
-//!     też kończy proces — głośno i z instrukcją, zamiast zostawiać niemego
-//!     zombie, którym byliśmy wcześniej.
-//!  2. StreamFlags::DONT_RECONNECT — UWAGA, to NIE jest ochrona przed
-//!     fallbackiem przy PIERWSZYM linkowaniu (prepare-link.lua sięga wtedy po
-//!     domyślny sink tak samo). Działa dopiero po pierwszym udanym
-//!     zlinkowaniu i wtedy działa aż za dobrze: prepare-link.lua:72-76
-//!     (`if not reconnect and si_flags.was_handled then target = nil;
-//!     goto done end`) przeskakuje ZARÓWNO `sendClientError`, JAK
-//!     I `node:request_destroy()`. Bez punktu 1 zniknięcie celu daje więc
-//!     niemego zombie bez jednego wiersza w logu.
-//!  3. `node.link-group` o tej samej wartości na obu strumieniach — jedyny
-//!     zamek, który nie zależy od naszych właściwości: linking-utils.lua
+//! MODEL: przelotowy łącznik z tłumaczem w środku. Użytkownik wybiera swój
+//! sprzęt w KDE tak jak zawsze, a przelotka siedzi w torze i PODĄŻA za tym
+//! wyborem. Programu NIE wybiera się jako urządzenia (`node.virtual=true`,
+//! aplet głośności go nie pokazuje — i dobrze, o to chodzi) i program NIE
+//! wybiera urządzenia za użytkownika. Zmiana wyjścia w aplecie to ścieżka
+//! NORMALNA: demon ma ją przeżyć dowolną liczbę razy, bez restartu.
+//!
+//! Jak to działa w WirePlumberze 0.5.12 (sprawdzone w źródłach na tej
+//! maszynie, nie w dokumentacji):
+//!  - `filter.smart=true` na węźle MAIN (tym bez "Stream" w media.class)
+//!    włącza cały mechanizm: lib/filter-utils.lua `rescanFilters` wciąga nas
+//!    do tablicy filtrów, a `getFilterSmart` bez tego klucza zwraca false
+//!    i mechanizm śpi. Węzeł STREAM (`Stream/Output/Audio`, ten sam
+//!    link-group) jest dobierany do pary automatycznie.
+//!  - BRAK `filter.smart.target` jest tu WARTOŚCIĄ, nie brakiem: robi z nas
+//!    filtr „bezcelowy" (`getFilterSmartTargetless`, filter-utils.lua:161).
+//!    Aplikacje idące do domyślnego wyjścia trafiają wtedy w nas
+//!    (get-filter-from-target.lua sięga po `get_filter_from_target(dir, mt,
+//!    nil)`, gałąź `target == nil and v.targetless`) — to wzorzec
+//!    EasyEffects. Ustawienie `filter.smart.target` przypięłoby nas na
+//!    sztywno do jednego sprzętu, czyli dokładnie odwrotnie do celu.
+//!  - nasz własny STREAM nie ma żadnego zdefiniowanego celu, więc
+//!    find-filter-target.lua oddaje sterowanie, a find-default-target.lua
+//!    linkuje go do AKTUALNIE domyślnego sinka.
+//!  - przy zmianie domyślnego wyjścia rescan.lua (interest na
+//!    `metadata-changed` / `default.audio.sink`) planuje ponowne
+//!    przetworzenie, a prepare-link.lua — dopóki strumień JEST
+//!    „reconnect" — zrywa stary link i robi nowy („moving to new target").
+//!    Bez restartu procesu.
+//!
+//! CZEGO TU CELOWO NIE MA I DLACZEGO:
+//!  - `target.object` na strumieniu: find-defined-target.lua ustawia wtedy
+//!    `has_defined_target=true` i przypina nas na stałe do JEDNEGO sprzętu.
+//!  - `StreamFlags::DONT_RECONNECT`: prepare-link.lua:73-76
+//!    (`if not reconnect and si_flags.was_handled then target = nil`) —
+//!    po pierwszym zlinkowaniu filtr NIGDY by się nie przeniósł na nowe
+//!    wyjście. To jest wprost sprzeczne z modelem przelotki.
+//!  - `node.dont-fallback`: przy `filter.smart` ten klucz jest dla nas
+//!    ZABÓJCZY. find-filter-target.lua wykrywa nas jako smart filter, dla
+//!    filtra bezcelowego nie ma celu do zwrócenia i wchodzi w gałąź
+//!    `is_smart_filter and dont_fallback`: `sendClientError` +
+//!    `node:request_destroy()`. Czyli własnoręczne niszczenie własnego
+//!    węzła przy każdym rescanie.
+//!  - własnego wyboru urządzenia (dawne `pick_output`): wybiera
+//!    WirePlumber, my nie mamy w tym głosu ani potrzeby.
+//!
+//! Ochrona przed pętlą sprzężenia — co zostało i co faktycznie działa:
+//!  1. `node.link-group` o tej samej wartości na obu węzłach. To jedyny
+//!     zamek, który nie zależy od żadnej naszej decyzji: linking-utils.lua
 //!     `canLinkGroupCheck` odmawia linkowania węzłów o tej samej wartości
-//!     i rekurencyjnie (do 8 hopów) wykrywa pętle pośrednie.
-//!  4. przy automatycznym wyborze celu odfiltrowujemy własne węzły I każdy
-//!     wirtualny sink obcego pochodzenia (akceptujemy tylko sprzęt ALSA/BT).
+//!     i rekurencyjnie (do 8 hopów) wykrywa pętle pośrednie. Sprawdzany
+//!     przez `canLink` na KAŻDEJ ścieżce wyboru celu, także w
+//!     find-default-target.lua.
+//!  2. filter-utils.lua pomija cele mające `node.link-group` ORAZ
+//!     `filter.smart` (getFilterSmartTarget:139-142) — żaden inny
+//!     inteligentny filtr nie wskaże nas jako celu i my nie wskażemy jego.
+//!  3. przypadek, którego NIE da się zablokować od naszej strony: gdy
+//!     użytkownik ustawi NASZ węzeł jako domyślne wyjście, domyślnym celem
+//!     naszego strumienia stajemy się my sami, `canLink` odmawia i zostajemy
+//!     niezlinkowani — cicho. Programowi nie wolno tu naprawiać metadanych
+//!     (nie nadpisujemy konfiguracji audio użytkownika), więc robi jedyną
+//!     uczciwą rzecz: wykrywa ten stan przy starcie i KRZYCZY w logu,
+//!     podając nazwę urządzenia do wybrania (`warn_if_default_is_us`).
 //!
 //! Odporność: oba strumienie rejestrują `state_changed`. Prawdziwy błąd
 //! strumienia (`stream.state()` faktycznie w Error) albo przejście
@@ -39,16 +74,11 @@
 //! kończy program głośno zamiast zostawiać go jako cichego zombie. Rutynowy
 //! błąd sesyjny od WirePlumbera — dostarczany jako zdarzenie `Error` BEZ
 //! zmiany stanu strumienia — jest tylko logowany, z dławieniem; szczegóły
-//! przy `verdict`. To samo dotyczy śmierci dowolnego wątku toru AI —
-//! sygnalizuje ją `health_rx` przekazany z `pipeline::spawn`.
-//!
-//! CZEGO TU NIE MA: cel odtwarzania jest ustalany RAZ, przy starcie
-//! (`pick_output`), i NIE podąża za zmianą domyślnego wyjścia w KDE.
-//! `lutils.checkFollowDefault` (linking-utils.lua:180-184) wymaga
-//! `reconnect and not is_filter`, a my mamy i DONT_RECONNECT, i
-//! `node.link-group` (`is_filter = si_props["node.link-group"] ~= nil`).
-//! Zmiana wyjścia w aplecie jest więc dla nas wyłącznie LOGOWANA
-//! (`DefaultSinkWatch`), a faktyczne przepięcie wymaga restartu programu.
+//! przy `verdict`. W modelu przelotki to rozróżnienie jest WAŻNIEJSZE niż
+//! wcześniej: chwilowy brak celu (przełączanie profilu karty, uśpienie
+//! słuchawek, zmiana urządzenia w aplecie) jest teraz ścieżką NORMALNĄ
+//! i nie ma prawa kończyć procesu. Śmierć wątku toru AI sygnalizuje
+//! `health_rx` przekazany z `pipeline::spawn`.
 
 use anyhow::{bail, Result};
 use pipewire as pw;
@@ -175,9 +205,15 @@ pub fn pass_samples_to_ms(samples: u64) -> f32 {
 
 pub const SINK_NODE_NAME: &str = "nacelle-translator-sink";
 pub const OUT_NODE_NAME: &str = "nacelle-translator-out";
-/// prefiksy node.name wskazujące realny sprzęt — jedyne dopuszczalne przy
-/// automatycznym wyborze celu (nigdy cudzy wirtualny sink: pętla sprzężenia)
-const HARDWARE_NAME_PREFIXES: &[&str] = &["alsa_output.", "bluez_output."];
+/// `filter.smart.name` — nazwa filtra w tablicy WirePlumbera. Bez niej
+/// filter-utils.lua bierze `node.link-group` (getFilterSmartName:74), więc
+/// technicznie jest opcjonalna; podajemy ją jawnie, bo to po niej inne filtry
+/// (i my sami, gdyby kiedyś doszło `filter.smart.before/after`) identyfikują
+/// nas w kolejności łańcucha.
+const FILTER_SMART_NAME: &str = "nacelle-translator";
+/// wspólna grupa obu węzłów — dla WirePlumbera dowód, że jesteśmy filtrem,
+/// i jednocześnie zamek `canLinkGroupCheck` przeciw pętli sprzężenia
+const LINK_GROUP: &str = "nacelle-translator";
 
 #[derive(Clone, Debug)]
 pub struct SinkInfo {
@@ -399,12 +435,18 @@ fn read_default_sink_name(
     mainloop: &pw::main_loop::MainLoopRc,
     core: &pw::core::CoreRc,
 ) -> (Option<String>, DefaultSinkWatch) {
-    let our_target: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    // Uzbrajane dopiero po odczycie startowym (`arm()`), żeby początkowy
+    // zrzut metadanych nie udawał zmiany zrobionej przez użytkownika.
+    let armed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // Stos poprzednich wyborów czytamy RAZ, przy starcie: w callbacku
+    // metadanych nie ma po co dotykać dysku, a treść i tak się nie zmienia
+    // w sposób, który by nam pomógł (WirePlumber zapisuje ten plik leniwie).
+    let state_raw: Rc<Option<String>> = Rc::new(read_wp_state());
     let registry = match core.get_registry_rc() {
         Ok(r) => r,
         Err(e) => {
             log::debug!("nie mogę pobrać rejestru do odczytu domyślnego wyjścia: {e:#}");
-            return (None, DefaultSinkWatch::inert(our_target));
+            return (None, DefaultSinkWatch::inert(armed));
         }
     };
     let metadata_bound: Rc<RefCell<Option<pw::metadata::Metadata>>> = Rc::new(RefCell::new(None));
@@ -421,7 +463,8 @@ fn read_default_sink_name(
             let metadata_listener = metadata_listener.clone();
             let configured = configured.clone();
             let active = active.clone();
-            let our_target = our_target.clone();
+            let armed = armed.clone();
+            let state_raw = state_raw.clone();
             move |g| {
                 if g.type_ != pw::types::ObjectType::Metadata
                     || metadata_bound.borrow().is_some()
@@ -439,7 +482,8 @@ fn read_default_sink_name(
                     .property({
                         let configured = configured.clone();
                         let active = active.clone();
-                        let our_target = our_target.clone();
+                        let armed = armed.clone();
+                        let state_raw = state_raw.clone();
                         move |_subject, key, _type_, value| {
                             let slot = match key {
                                 Some("default.configured.audio.sink") => Some(&configured),
@@ -450,27 +494,27 @@ fn read_default_sink_name(
                                 if let Ok(j) = serde_json::from_str::<serde_json::Value>(v) {
                                     if let Some(n) = j["name"].as_str() {
                                         *slot.borrow_mut() = Some(n.to_string());
-                                        // `our_target` jest wypełniane dopiero po
-                                        // `pick_output`, więc przy starcie ta gałąź
-                                        // milczy — odzywa się WYŁĄCZNIE przy
-                                        // późniejszej zmianie zrobionej przez
-                                        // użytkownika.
-                                        if key == Some("default.configured.audio.sink") {
-                                            if let Some(t) = our_target.borrow().as_deref() {
-                                                if n != t && n != SINK_NODE_NAME {
-                                                    log::warn!(
-                                                        "domyślne wyjście dźwięku zmieniono na \
-                                                         \"{n}\", ale translator gra dalej w \
-                                                         \"{t}\" — cel jest ustalany raz, przy \
-                                                         starcie, i nie podąża za apletem \
-                                                         (DONT_RECONNECT + node.link-group \
-                                                         wyłączają checkFollowDefault \
-                                                         WirePlumbera). Żeby przepiąć: \
-                                                         zrestartuj translator (albo wskaż cel \
-                                                         w [audio].output_device)."
-                                                    );
-                                                }
-                                            }
+                                        // Zmiana urządzenia w aplecie KDE to
+                                        // ścieżka NORMALNA — przelotka
+                                        // przepina się sama (rescan.lua +
+                                        // prepare-link.lua, patrz nagłówek
+                                        // pliku). Logujemy ją, bo bez tego
+                                        // wpisu nie da się z logu sesji
+                                        // sprawdzić, że demon przeżył
+                                        // przełączenie — a to jest wymaganie
+                                        // twarde, nie ciekawostka.
+                                        if key == Some("default.configured.audio.sink")
+                                            && armed.get()
+                                            && !warn_if_default_is_us(
+                                                Some(n),
+                                                state_raw.as_deref(),
+                                            )
+                                        {
+                                            log::info!(
+                                                "domyślne wyjście dźwięku zmieniono na \"{n}\" \
+                                                 — przelotka podąża za tym wyborem sama, bez \
+                                                 restartu"
+                                            );
                                         }
                                     }
                                 }
@@ -503,7 +547,7 @@ fn read_default_sink_name(
         Ok(())
     })() {
         log::debug!("odczyt domyślnego wyjścia: {e:#}");
-        return (None, DefaultSinkWatch::inert(our_target));
+        return (None, DefaultSinkWatch::inert(armed));
     }
 
     // przebieg 2: gwarantuje dotarcie początkowego zrzutu property() z metadanych
@@ -524,7 +568,7 @@ fn read_default_sink_name(
         Ok(())
     })() {
         log::debug!("odczyt domyślnego wyjścia (przebieg 2): {e:#}");
-        return (None, DefaultSinkWatch::inert(our_target));
+        return (None, DefaultSinkWatch::inert(armed));
     }
 
     // `borrow().clone()` zamiast `take()`: podpięcie ma żyć dalej i porównywać
@@ -534,7 +578,8 @@ fn read_default_sink_name(
         .clone()
         .or_else(|| active.borrow().clone());
     let watch = DefaultSinkWatch {
-        our_target,
+        armed,
+        state_raw,
         _md: metadata_bound.take(),
         _md_listener: metadata_listener.take(),
     };
@@ -544,14 +589,16 @@ fn read_default_sink_name(
 /// Żywe podpięcie do obiektu metadanych "default" — WYŁĄCZNIE do odczytu.
 ///
 /// Dopóki uchwyty żyją, serwer woła nasz `property()` przy każdej zmianie
-/// domyślnego wyjścia. Program niczego tu nie zapisuje ani nie przełącza;
-/// jedyny efekt zmiany to ostrzeżenie w logu, że translator gra dalej
-/// w urządzenie wybrane przy starcie (patrz nagłówek pliku, „CZEGO TU NIE
-/// MA"). Bez tego podpięcia rozjazd „wybrałem głośniki, a słychać słuchawki"
-/// jest całkowicie niewidoczny.
+/// domyślnego wyjścia. Program niczego tu nie zapisuje ani nie przełącza:
+/// przepięciem zajmuje się WirePlumber, a my tylko to odnotowujemy —
+/// i krzyczymy w jedynym przypadku, którego nie da się rozwiązać po naszej
+/// stronie (domyślnym wyjściem jesteśmy MY sami).
 struct DefaultSinkWatch {
-    /// nazwa węzła, w który faktycznie gramy; wypełniana po `pick_output`
-    our_target: Rc<RefCell<Option<String>>>,
+    /// dopóki `false`, callback milczy — inaczej początkowy zrzut metadanych
+    /// wyglądałby jak przełączenie urządzenia zrobione przez użytkownika
+    armed: Rc<Cell<bool>>,
+    /// stos poprzednich wyborów z pliku stanu WirePlumbera (odczyt raz)
+    state_raw: Rc<Option<String>>,
     _md: Option<pw::metadata::Metadata>,
     _md_listener: Option<pw::metadata::MetadataListener>,
 }
@@ -559,16 +606,23 @@ struct DefaultSinkWatch {
 impl DefaultSinkWatch {
     /// wariant bez podpięcia (nie udało się dobić do metadanych) — wszystkie
     /// metody działają, tylko nikt nigdy nie zawoła `property()`
-    fn inert(our_target: Rc<RefCell<Option<String>>>) -> Self {
+    fn inert(armed: Rc<Cell<bool>>) -> Self {
         Self {
-            our_target,
+            armed,
+            state_raw: Rc::new(None),
             _md: None,
             _md_listener: None,
         }
     }
 
-    fn set_target(&self, name: &str) {
-        *self.our_target.borrow_mut() = Some(name.to_string());
+    /// Stos poprzednich wyborów — do komunikatu „wybierz z powrotem X".
+    fn state_raw(&self) -> Option<&str> {
+        self.state_raw.as_deref()
+    }
+
+    /// Od tej chwili każda zmiana domyślnego wyjścia jest zmianą użytkownika.
+    fn arm(&self) {
+        self.armed.set(true);
     }
 }
 
@@ -584,75 +638,78 @@ pub fn discover_sinks() -> Result<(Vec<SinkInfo>, Option<String>)> {
     Ok((sinks, default))
 }
 
-/// Wybór sprzętowego celu odtwarzania — w kolejności:
-///  1. `output_device` z konfiguracji (jawny wybór użytkownika),
-///  2. aktualnie skonfigurowane domyślne wyjście odczytane z PipeWire
-///     (dokładnie "urządzenie, które mam ustawione jako obecne urządzenie
-///     wyjścia dźwięku"; TYLKO odczyt — program niczego tu nie przełącza),
-///  3. pierwszy węzeł sprzętowy pasujący do prefiksu (ostatnia deska
-///     ratunku, gdy powyższe zawiodą).
-/// Nigdy własny węzeł (pętla!) i nigdy cudzy wirtualny sink (np.
-/// EasyEffects) — jego wyjście gra do domyślnego urządzenia, którym może
-/// być właśnie nasz sink, co zapętla graf.
-pub fn pick_output(
-    sinks: &[SinkInfo],
-    requested: Option<&str>,
-    default_sink: Option<&str>,
-) -> Result<SinkInfo> {
+/// Plik stanu WirePlumbera z zapamiętanym wyborem wyjścia (względem $HOME).
+/// TYLKO DO ODCZYTU — program nie zapisuje konfiguracji audio użytkownika.
+const WP_DEFAULT_NODES_STATE: &str = ".local/state/wireplumber/default-nodes";
+
+/// Nazwa urządzenia, które użytkownik miał wybrane, ZANIM domyślnym wyjściem
+/// stał się nasz węzeł — z pliku stanu WirePlumbera.
+///
+/// WirePlumber trzyma tam nie jedną wartość, tylko stos: bieżący wybór pod
+/// `default.configured.audio.sink`, a poprzednie pod `...sink.0`, `.1`, `.2`
+/// (rosnąco = coraz starsze). Gdy bieżącym wyborem jesteśmy MY, jedyne
+/// miejsce, gdzie przetrwała nazwa prawdziwego sprzętu, to właśnie ten stos —
+/// metadana w PipeWire jest już nadpisana.
+///
+/// Bierzemy pierwszy wpis, który nie jest naszym węzłem: gdy użytkownik
+/// przełączał się na nas kilka razy, `.0` też potrafi wskazywać na nas.
+/// Format pliku jest INI-podobny (sekcja `[default-nodes]`, potem
+/// `klucz=wartość`), więc parsujemy go po znaku `=` i nic więcej nie zakładamy.
+fn previous_configured_sink(raw: &str) -> Option<String> {
     let own = [SINK_NODE_NAME, OUT_NODE_NAME];
-    // pusty string w konfigu (np. wyczyszczone pole zamiast zakomentowane)
-    // ma znaczyć to samo co brak wartości — automatyczny wybór
-    let requested = requested.filter(|s| !s.is_empty());
-    if let Some(name) = requested {
-        if own.contains(&name) {
-            bail!("output_device wskazuje na własny węzeł translatora — to byłaby pętla");
-        }
-        if let Some(s) = sinks.iter().find(|s| s.name == name) {
-            return Ok(s.clone());
-        }
-        bail!(
-            "nie znalazłem urządzenia \"{name}\" wśród węzłów Audio/Sink \
-             (lista: nacelle-translator devices)"
-        );
+    let mut candidates: Vec<(u32, &str)> = raw
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .filter_map(|(k, v)| {
+            let idx = k.trim().strip_prefix("default.configured.audio.sink.")?;
+            Some((idx.parse::<u32>().ok()?, v.trim()))
+        })
+        .filter(|(_, v)| !v.is_empty() && !own.contains(v))
+        .collect();
+    // Kolejność linii w pliku jest przypadkowa (to zrzut tablicy haszującej),
+    // więc „pierwszy" musi znaczyć „o najniższym indeksie", a nie „najwyżej".
+    candidates.sort_by_key(|(i, _)| *i);
+    candidates.first().map(|(_, v)| v.to_string())
+}
+
+/// Jedyna reakcja programu na sytuację „użytkownik ustawił NASZ węzeł jako
+/// domyślne wyjście dźwięku": jeden głośny wpis w logu.
+///
+/// Dlaczego tylko log. W tym stanie domyślnym celem naszego strumienia
+/// odtwarzania stajemy się my sami, `canLinkGroupCheck` odmawia linkowania
+/// (patrz nagłówek pliku, punkt 1) i przelotka milknie. Naprawić dałoby się
+/// to jednym zapisem `default.configured.audio.sink` — i tego WŁAŚNIE nie
+/// robimy: program nie nadpisuje konfiguracji audio użytkownika. Zostaje
+/// powiedzieć głośno, co jest nie tak i co kliknąć.
+///
+/// `log::error!`, nie `warn`: bez tej zmiany przez użytkownika program jest
+/// niemy, więc to nie jest „uwaga na marginesie".
+fn warn_if_default_is_us(default_sink: Option<&str>, state_raw: Option<&str>) -> bool {
+    let own = [SINK_NODE_NAME, OUT_NODE_NAME];
+    if !default_sink.is_some_and(|n| own.contains(&n)) {
+        return false;
     }
-    // Gdy metadana wskazuje na nas samych (użytkownik wcześniej wybrał
-    // "Nacelle Translator (PL)" jako domyślne wyjście), informacja o prawdziwym
-    // sprzęcie jest bezpowrotnie nadpisana — spadamy do heurystyki niżej.
-    if let Some(name) = default_sink.filter(|n| !own.contains(n)) {
-        if let Some(s) = sinks.iter().find(|s| s.name == name) {
-            return Ok(s.clone());
-        }
-    }
-    // Ostatnia deska ratunku — działa TYLKO dopóki użytkownik nie wybierze
-    // nas jako domyślnego wyjścia (od tego momentu metadana wyżej zawsze
-    // wskazuje na nas samych i to jest jedyna ścieżka, jaka zostaje).
-    // Zestawy słuchawkowe niemal zawsze wpinają się przez USB albo
-    // Bluetooth, nie przez wbudowane audio płyty głównej (PCI) — wolimy je,
-    // żeby zgadywanka nie trafiała regularnie w onboard zamiast słuchawek.
-    sinks
-        .iter()
-        .filter(|s| {
-            !own.contains(&s.name.as_str())
-                && HARDWARE_NAME_PREFIXES
-                    .iter()
-                    .any(|p| s.name.starts_with(p))
-        })
-        .max_by_key(|s| {
-            if s.name.contains("usb-") {
-                2
-            } else if s.name.starts_with("bluez_output.") {
-                1
-            } else {
-                0
-            }
-        })
-        .cloned()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "brak jednoznacznego sprzętowego węzła Audio/Sink (alsa_output.*/bluez_output.*) — \
-                 ustaw [audio].output_device w nacelle-translator.toml (lista: nacelle-translator devices)"
-            )
-        })
+    let hint = match state_raw.and_then(previous_configured_sink) {
+        Some(prev) => format!("Wybierz z powrotem swoje urządzenie, czyli \"{prev}\""),
+        // Brak pliku stanu albo sam nasz węzeł w całym stosie: nie zgadujemy
+        // sprzętu — od tego jest `nacelle-translator devices`.
+        None => "Wybierz swoje urządzenie (lista: nacelle-translator devices)".to_string(),
+    };
+    log::error!(
+        "domyślnym wyjściem dźwięku jest NASZ własny węzeł ({SINK_NODE_NAME}) — w tym \
+         ustawieniu translator nie ma dokąd grać i będzie NIEMY. Translator jest przelotką \
+         w torze, a nie urządzeniem: nie wybiera się go jako wyjścia, tylko wpina się sam \
+         w to, co masz wybrane. {hint} — w Ustawieniach systemowych KDE → Dźwięk (albo \
+         `wpctl set-default <ID>`). Translator podąży za tym wyborem sam, bez restartu."
+    );
+    true
+}
+
+/// Odczyt pliku stanu WirePlumbera. `None` przy braku pliku albo braku $HOME —
+/// to nie jest błąd, tylko brak podpowiedzi w komunikacie.
+fn read_wp_state() -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    std::fs::read_to_string(std::path::Path::new(&home).join(WP_DEFAULT_NODES_STATE)).ok()
 }
 
 struct SinkState {
@@ -746,13 +803,11 @@ const SESSION_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
 fn watch_stream<D>(
     name: &'static str,
-    target_name: &str,
     fatal: &Fatal,
     ml: &pw::main_loop::MainLoopRc,
 ) -> impl FnMut(&pw::stream::Stream, &mut D, StreamState, StreamState) {
     let fatal = fatal.clone();
     let ml = ml.clone();
-    let target_name = target_name.to_string();
     let last_warn: Cell<Option<std::time::Instant>> = Cell::new(None);
     let suppressed = Cell::new(0u64);
     // ostatni komunikat sesyjny — jedyna konkretna wskazówka, jaką serwer nam
@@ -782,10 +837,14 @@ fn watch_stream<D>(
                     } else {
                         String::new()
                     };
+                    // W modelu przelotki chwilowy brak celu jest ścieżką
+                    // NORMALNĄ (przełączanie urządzenia w aplecie, zmiana
+                    // profilu karty, uśpione słuchawki) — WirePlumber
+                    // dolinkuje nas z powrotem sam.
                     log::warn!(
-                        "{name}: błąd sesyjny od serwera przy celu \"{target_name}\" \
-                         (zwykle brak celu albo nieudany link), stan strumienia bez zmian — \
-                         pracuję dalej: {msg}{tail}"
+                        "{name}: błąd sesyjny od serwera (zwykle przejściowy brak celu albo \
+                         nieudany link), stan strumienia bez zmian — pracuję dalej: \
+                         {msg}{tail}"
                     );
                     last_warn.set(Some(now));
                 } else {
@@ -800,15 +859,17 @@ fn watch_stream<D>(
                     format!(" Ostatni komunikat serwera: {last}.")
                 };
                 let reason = match &new {
-                    StreamState::Error(m) => {
-                        format!("{name}: błąd strumienia (cel \"{target_name}\"): {m}")
-                    }
+                    StreamState::Error(m) => format!("{name}: błąd strumienia: {m}"),
+                    // To NIE jest „zniknął cel" — utrata celu jest tu ścieżką
+                    // normalną i kończy się warnem wyżej. `Unconnected`
+                    // powstaje wyłącznie w proxy_removed/proxy_destroy/
+                    // on_core_error(-EPIPE), czyli gdy serwer zniszczył nasz
+                    // węzeł albo padło połączenie.
                     _ => format!(
-                        "{name}: węzeł wypadł z grafu — cel odtwarzania \"{target_name}\" \
-                         zniknął albo zerwało się połączenie z PipeWire.{hint} \
-                         Co zrobić: włącz to urządzenie i uruchom translator ponownie, \
-                         albo wskaż inne w [audio].output_device \
-                         (lista: nacelle-translator devices)."
+                        "{name}: węzeł wypadł z grafu — serwer PipeWire zniszczył nasz węzeł \
+                         albo zerwało się połączenie z demonem.{hint} \
+                         Co zrobić: sprawdź `systemctl --user status pipewire wireplumber` \
+                         i uruchom translator ponownie."
                     ),
                 };
                 drop(last);
@@ -822,7 +883,6 @@ fn watch_stream<D>(
 /// Buduje graf i blokuje w pętli głównej do SIGINT/SIGTERM, błędu strumienia
 /// albo śmierci dowolnego wątku toru AI (`health_rx`).
 pub fn run_graph(
-    output_device: Option<&str>,
     rings: RtRings,
     duck: DuckParams,
     gate: TranslateGate,
@@ -837,18 +897,23 @@ pub fn run_graph(
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
 
-    let sinks = enumerate_sinks(&mainloop, &core)?;
+    // Odczyt (i TYLKO odczyt) domyślnego wyjścia. Nie po to, żeby coś wybrać
+    // — wybiera WirePlumber — tylko żeby wyłapać jedyny stan, w którym
+    // przelotka nie ma dokąd grać: gdy domyślnym wyjściem jesteśmy my sami.
+    // `default_watch` MUSI dożyć końca `run_graph`: jego wcześniejszy drop
+    // wypina słuchacza i późniejsze zmiany urządzenia znikają z logu.
     let (default_sink, default_watch) = read_default_sink_name(&mainloop, &core);
-    let target = pick_output(&sinks, output_device, default_sink.as_deref())?;
-    // Od tej chwili podpięcie do metadanych ma co porównywać. `default_watch`
-    // MUSI dożyć końca `run_graph` — jego wcześniejszy drop wypina słuchacza
-    // i zmiana wyjścia w KDE znów staje się niewidoczna.
-    default_watch.set_target(&target.name);
-    log::info!(
-        "cel odtwarzania: {} ({})",
-        target.name,
-        target.description
-    );
+    warn_if_default_is_us(default_sink.as_deref(), default_watch.state_raw());
+    match default_sink.as_deref() {
+        Some(n) => log::info!("aktualne domyślne wyjście (odczyt): {n}"),
+        None => log::info!(
+            "nie udało się odczytać domyślnego wyjścia — to nie jest błąd, cel i tak wybiera \
+             WirePlumber"
+        ),
+    }
+    // Od tej chwili każde wywołanie callbacku metadanych to zmiana zrobiona
+    // przez użytkownika, a nie zrzut startowy.
+    default_watch.arm();
 
     let RtRings {
         cap_prod,
@@ -872,8 +937,36 @@ pub fn run_graph(
             "media.class" => "Audio/Sink",
             *pw::keys::NODE_NAME => SINK_NODE_NAME,
             *pw::keys::NODE_DESCRIPTION => "Nacelle Translator (PL)",
+            // ZAMIERZONE, nie obejście: przelotki nie wybiera się jako
+            // urządzenia. `node.virtual=true` + `filterVirtualDevices`
+            // w plasma-pa chowa nas z listy wyjść w aplecie, czyli dokładnie
+            // to, czego chcemy — użytkownik ma widzieć swój sprzęt, a nas nie.
+            // Wcześniej ta właściwość była problemem, bo trzeba było nas
+            // wskazać ręcznie; od `filter.smart` wpinamy się sami.
             "node.virtual" => "true",
-            "node.link-group" => "nacelle-translator",
+            "node.link-group" => LINK_GROUP,
+            // Bez tego KLUCZA cały mechanizm inteligentnych filtrów śpi:
+            // getFilterSmart (filter-utils.lua:36-37) zwraca false i nikt
+            // nigdy nie wpina nas w tor. To jest jedyna właściwość, która
+            // odróżnia „para węzłów w jednej grupie" od „przelotka".
+            "filter.smart" => "true",
+            "filter.smart.name" => FILTER_SMART_NAME,
+            // CELOWO BRAK `filter.smart.target` — patrz nagłówek pliku.
+            // Filtr bezcelowy wpina się w AKTUALNIE domyślne wyjście
+            // (wzorzec EasyEffects); podanie tego klucza przypięłoby nas
+            // do jednego sprzętu na sztywno.
+            //
+            // Nie usypiaj nas po bezczynności: suspend-node.lua:39-45 przy
+            // wartości 0 wychodzi bez ustawiania timera. Zawieszony węzeł
+            // filtra znika z toru, a jego powrót to dodatkowa dziura
+            // w dźwięku przy pierwszym odtwarzaniu.
+            "session.suspend-timeout-seconds" => "0",
+            // Nie przywracaj nam zapamiętanej głośności (state-stream.lua:58
+            // — nasz Audio/Sink bez `device.routes` też tam wpada). Nasz
+            // węzeł stoi w torze CAŁEGO dźwięku, więc stara wartość z pliku
+            // stanu ściszyłaby cichcem cały system, w miejscu, którego
+            // użytkownik nie widzi nawet w aplecie.
+            "state.restore-props" => "false",
             "audio.position" => "[ FL FR ]",
         },
     )?;
@@ -890,7 +983,7 @@ pub fn run_graph(
 
     let _sink_listener = sink_stream
         .add_local_listener_with_user_data(sink_state)
-        .state_changed(watch_stream("sink", &target.name, &fatal, &mainloop))
+        .state_changed(watch_stream("sink", &fatal, &mainloop))
         .param_changed(|_stream, _st, id, param| {
             let Some(param) = param else { return };
             if id != spa::param::ParamType::Format.as_raw() {
@@ -975,26 +1068,22 @@ pub fn run_graph(
         &mut sink_params,
     )?;
 
-    // ---------- 2) odtwarzanie (Direction::Output) w sprzęt ----------
-    let play_props = {
-        let mut p = properties! {
-            *pw::keys::MEDIA_TYPE => "Audio",
-            *pw::keys::MEDIA_CATEGORY => "Playback",
-            *pw::keys::NODE_NAME => OUT_NODE_NAME,
-            "node.link-group" => "nacelle-translator",
-            // Klucz WirePlumbera (PipeWire go nie zna — `strings
-            // libpipewire-0.3.so.0 | grep dont-` zwraca wyłącznie
-            // `node.dont-reconnect`). Czytany wprost z właściwości węzła
-            // w linking/find-defined-target.lua:38 i decyduje o gałęzi :116-127.
-            // Bez niego `target.object` jest tylko SUGESTIĄ: nietrafione
-            // dopasowanie przechodzi dalej, aż do find-default-target.lua,
-            // czyli do domyślnego sinka — a tym bywa NASZ sink. Z nim serwer
-            // zamiast fallbacku wysyła błąd i niszczy nasz węzeł, co strażnik
-            // `verdict` zamienia w głośne zakończenie z instrukcją.
-            "node.dont-fallback" => "true",
-        };
-        p.insert(*pw::keys::TARGET_OBJECT, target.name.as_str());
-        p
+    // ---------- 2) odtwarzanie (Direction::Output) — cel wybiera WirePlumber ----------
+    let play_props = properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CATEGORY => "Playback",
+        *pw::keys::NODE_NAME => OUT_NODE_NAME,
+        "node.link-group" => LINK_GROUP,
+        // Pozwól sprzętowi zasnąć, gdy przez przelotkę nic nie leci.
+        // Bez tego nasz strumień jest zwykłym, aktywnym klientem
+        // odtwarzania i trzyma kartę/słuchawki wybudzone 24/7 — a przelotka
+        // z definicji stoi w torze cały czas, więc „24/7" jest tu dosłowne.
+        "node.passive" => "true",
+        // CELOWO BRAK `target.object` i `node.dont-fallback` — patrz nagłówek
+        // pliku, sekcja „CZEGO TU CELOWO NIE MA". Pierwsze przypięłoby nas
+        // do jednego sprzętu, drugie kazałoby WirePlumberowi niszczyć nasz
+        // węzeł przy każdym rescanie (find-filter-target.lua, gałąź
+        // `is_smart_filter and dont_fallback`).
     };
     let play_stream = StreamBox::new(&core, OUT_NODE_NAME, play_props)?;
 
@@ -1012,7 +1101,7 @@ pub fn run_graph(
 
     let _play_listener = play_stream
         .add_local_listener_with_user_data(play_state)
-        .state_changed(watch_stream("playback", &target.name, &fatal, &mainloop))
+        .state_changed(watch_stream("playback", &fatal, &mainloop))
         .process(|stream, st: &mut PlayState| {
             let Some(mut buf) = stream.dequeue_buffer() else {
                 return;
@@ -1112,10 +1201,11 @@ pub fn run_graph(
     play_stream.connect(
         Direction::Output,
         None,
-        StreamFlags::AUTOCONNECT
-            | StreamFlags::MAP_BUFFERS
-            | StreamFlags::RT_PROCESS
-            | StreamFlags::DONT_RECONNECT,
+        // BEZ `DONT_RECONNECT` — to jest właśnie ta flaga, która czyniła
+        // przelotkę niemożliwą: prepare-link.lua:73-76 po pierwszym
+        // zlinkowaniu zerowałby cel zamiast przenieść nas na nowe wyjście.
+        // „Reconnect" to w modelu przelotki ścieżka NORMALNA, nie wyjątek.
+        StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
         &mut play_params,
     )?;
 
@@ -1199,10 +1289,13 @@ pub fn run_graph(
                     // NIE pisz tu „nieprzypięty do sprzętu" — to nieprawda.
                     // Odlinkowany węzeł DALEJ jest wołany („normally idle nodes
                     // keep processing", man 7 pipewire-props), a suspend go nie
-                    // dotyka: monitors/suspend-node.lua filtruje `Audio/*`,
+                    // dotyka: node/suspend-node.lua filtruje `Audio/*`,
                     // a my mamy `Stream/Output/Audio`. Zerowa liczba cykli
-                    // znaczy zawieszony węzeł albo stojący serwer — utratę celu
-                    // wykrywa `verdict` przez node.dont-fallback, nie ta linia.
+                    // znaczy zawieszony węzeł albo stojący serwer.
+                    //
+                    // Od modelu przelotki `node.passive=true` DOPUSZCZA, żeby
+                    // ta linia pojawiała się w normalnej pracy: gdy nikt nic
+                    // nie gra, sprzęt zasypia razem z nami i o to chodzi.
                     None => log::debug!(
                         "passthrough: ani jednego cyklu odtwarzania w ostatnich {}s \
                          — węzeł zawieszony albo serwer stanął",
@@ -1213,12 +1306,11 @@ pub fn run_graph(
     }
 
     log::info!(
-        "węzeł \"Nacelle Translator (PL)\" gotowy (node.name={SINK_NODE_NAME}) — skieruj do \
-         niego dźwięk: `wpctl set-default <ID>`, gdzie ID bierzesz z `nacelle-translator \
-         devices`. UWAGA: aplet głośności KDE UKRYWA ten węzeł na liście urządzeń \
-         (node.virtual=true + filterVirtualDevices w plasma-pa), więc w samym aplecie go \
-         nie znajdziesz — działa za to przenoszenie aplikacji w Ustawienia → Dźwięk → \
-         Aplikacje. Ctrl+C kończy"
+        "przelotka \"Nacelle Translator (PL)\" gotowa (node.name={SINK_NODE_NAME}, \
+         filter.smart) — NIC NIE TRZEBA USTAWIAĆ. Węzeł wpina się sam w to wyjście, które \
+         masz aktualnie wybrane w KDE, i podąża za każdą jego zmianą bez restartu. \
+         W aplecie głośności go NIE ZOBACZYSZ i tak ma być: to przelotka w torze, \
+         a nie urządzenie do wybrania. Ctrl+C kończy"
     );
     mainloop.run();
 
@@ -1355,6 +1447,79 @@ mod tests {
         s.observe(100, 0);
         // nowe okno nie może odziedziczyć kwantu po poprzednim
         assert_eq!(s.take().unwrap().quantum_frames, 0);
+    }
+
+    /// Realny kształt pliku ~/.local/state/wireplumber/default-nodes w chwili,
+    /// gdy użytkownik ma ustawiony NASZ węzeł jako domyślne wyjście.
+    const STATE: &str = "\
+[default-nodes]
+default.configured.audio.sink=nacelle-translator-sink
+default.configured.audio.sink.0=alsa_output.usb-Logitech.analog-stereo
+default.configured.audio.sink.1=alsa_output.pci-0000_73_00.6.analog-stereo
+";
+
+    #[test]
+    fn p1_stos_wyborow_daje_poprzednie_urzadzenie() {
+        assert_eq!(
+            previous_configured_sink(STATE).as_deref(),
+            Some("alsa_output.usb-Logitech.analog-stereo")
+        );
+    }
+
+    #[test]
+    fn p2_najnizszy_indeks_wygrywa_niezaleznie_od_kolejnosci_linii() {
+        // Plik jest zrzutem tablicy haszującej — kolejność linii bywa dowolna,
+        // więc „pierwszy" musi wynikać z indeksu, a nie z pozycji w pliku.
+        let raw = "default.configured.audio.sink.2=c\n\
+                   default.configured.audio.sink.0=a\n\
+                   default.configured.audio.sink.1=b\n";
+        assert_eq!(previous_configured_sink(raw).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn p3_wlasne_wezly_nie_moga_byc_podpowiedzia() {
+        // Po kilku przełączeniach na nas potrafimy siedzieć także w stosie;
+        // podpowiedź „wybierz z powrotem translator" byłaby błędnym kołem.
+        let raw = format!(
+            "default.configured.audio.sink.0={SINK_NODE_NAME}\n\
+             default.configured.audio.sink.1={OUT_NODE_NAME}\n\
+             default.configured.audio.sink.2=alsa_output.realny\n"
+        );
+        assert_eq!(
+            previous_configured_sink(&raw).as_deref(),
+            Some("alsa_output.realny")
+        );
+        // sam nasz węzeł w całym stosie = brak podpowiedzi, NIE zgadywanka
+        let tylko_my = format!("default.configured.audio.sink.0={SINK_NODE_NAME}\n");
+        assert_eq!(previous_configured_sink(&tylko_my), None);
+    }
+
+    #[test]
+    fn p4_smieci_i_klucz_biezacy_nie_wchodza_do_stosu() {
+        // `default.configured.audio.sink` BEZ indeksu to wybór BIEŻĄCY (czyli
+        // my) — nie wolno go zwrócić jako podpowiedzi
+        let raw = "[default-nodes]\n\
+                   default.configured.audio.sink=nacelle-translator-sink\n\
+                   default.configured.audio.source.0=alsa_input.mikrofon\n\
+                   default.configured.audio.sink.x=nie-liczba\n\
+                   default.configured.audio.sink.0=\n";
+        assert_eq!(previous_configured_sink(raw), None);
+        assert_eq!(previous_configured_sink(""), None);
+    }
+
+    #[test]
+    fn p5_alarm_tylko_gdy_domyslnym_jestesmy_my() {
+        // Zwykły sprzęt jako domyślne wyjście to stan NORMALNY — ani słowa.
+        assert!(!warn_if_default_is_us(Some("alsa_output.cokolwiek"), Some(STATE)));
+        // Brak odczytu też nie jest powodem do alarmu: cel i tak wybiera
+        // WirePlumber, a my o tym nie decydujemy.
+        assert!(!warn_if_default_is_us(None, Some(STATE)));
+        // Oba nasze węzły są powodem: przy każdym z nich strumień nie ma
+        // dokąd grać (canLinkGroupCheck odmawia w obie strony).
+        assert!(warn_if_default_is_us(Some(SINK_NODE_NAME), Some(STATE)));
+        assert!(warn_if_default_is_us(Some(OUT_NODE_NAME), Some(STATE)));
+        // ... i brak pliku stanu nie może tego alarmu wyciszyć
+        assert!(warn_if_default_is_us(Some(SINK_NODE_NAME), None));
     }
 
     #[test]

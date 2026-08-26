@@ -114,6 +114,9 @@ fn cmd_run(config_path: &PathBuf, experimental: &experimental::Selection) -> Res
     if let Some(w) = cfg.tuning_warning() {
         log::warn!("{w}");
     }
+    if let Some(w) = cfg.output_device_warning() {
+        log::warn!("{w}");
+    }
 
     // ringbuffery RT ↔ tor AI
     let (cap_prod, cap_cons) = HeapRb::<f32>::new(pw::RATE as usize * 4).split(); // mono, 4 s
@@ -134,7 +137,6 @@ fn cmd_run(config_path: &PathBuf, experimental: &experimental::Selection) -> Res
     let health_rx = pipeline::spawn(cfg.clone(), cap_cons, tts_prod)?;
 
     pw::run_graph(
-        cfg.audio.output_device.as_deref(),
         pw::RtRings {
             cap_prod,
             pass_prod,
@@ -207,6 +209,9 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
     // UWAGA, nie BŁĄD: konfiguracja jest poprawna, tylko dostrojona pod drugi
     // tor — nie ma powodu, żeby przez to zwracać kod wyjścia 1
     if let Some(w) = cfg.tuning_warning() {
+        println!("  UWAGA {w}");
+    }
+    if let Some(w) = cfg.output_device_warning() {
         println!("  UWAGA {w}");
     }
 
@@ -332,12 +337,21 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
                 Some(name) => println!("  OK    aktualne domyślne wyjście (odczyt): {name}"),
                 None => println!("  OK    aktualne domyślne wyjście: nie udało się odczytać (użyję heurystyki)"),
             }
-            match pw::pick_output(&sinks, cfg.audio.output_device.as_deref(), default.as_deref()) {
-                Ok(t) => println!("  OK    cel odtwarzania: {} ({})", t.name, t.description),
-                Err(e) => {
-                    println!("  BŁĄD  {e:#}");
-                    failures += 1;
-                }
+            // Celu NIE sprawdzamy — nie mamy go. Wybiera WirePlumber, a my
+            // wpinamy się w to, co jest domyślne w danej chwili. Jedyny stan
+            // wart zgłoszenia to ten, w którym domyślnym wyjściem jesteśmy MY:
+            // wtedy przelotka nie ma dokąd grać.
+            if default.as_deref() == Some(pw::SINK_NODE_NAME) {
+                println!(
+                    "  BŁĄD  domyślnym wyjściem dźwięku jest sam translator ({}) — w tym \
+                     ustawieniu będzie NIEMY.\n        Translator jest przelotką, nie \
+                     urządzeniem: wybierz w Ustawieniach systemowych → Dźwięk swój prawdziwy \
+                     sprzęt, a translator wpnie się w tor sam.",
+                    pw::SINK_NODE_NAME
+                );
+                failures += 1;
+            } else {
+                println!("  OK    translator wepnie się w aktualne domyślne wyjście (filter.smart)");
             }
         }
         Err(e) => {

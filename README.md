@@ -1,10 +1,20 @@
 # nacelle-translator
 
 Węzeł PipeWire, który **tłumaczy w locie dźwięk w drodze do urządzenia
-wyjściowego**. W grafie pojawia się urządzenie „Nacelle Translator (PL)" — wszystko,
-co aplikacje w nie grają, jest segmentowane, transkrybowane, tłumaczone na
-polski i czytane głosem lektora, a oryginał przechodzi dalej przyciszany pod
-lektorem (ducking, jak w telewizyjnym szeptance).
+wyjściowego**.
+
+Model działania to **przelotowy łącznik z tłumaczem w środku**: urządzenie
+wyjściowe wybierasz w KDE tak jak zawsze, a translator wpina się w ten tor
+sam i podąża za każdą zmianą urządzenia — bez restartu, bez ustawiania go
+jako wyjścia, bez jednego kliknięcia więcej. Technicznie robi to jako
+*inteligentny filtr* WirePlumbera (`filter.smart`), dokładnie tym samym
+mechanizmem co EasyEffects. W aplecie głośności **nie zobaczysz** żadnego
+nowego urządzenia i tak ma być.
+
+Dźwięk przechodzący przez przelotkę jest — o ile włączysz tłumaczenie —
+segmentowany, transkrybowany, tłumaczony na polski i czytany głosem lektora,
+a oryginał przechodzi dalej przyciszany pod lektorem (ducking, jak
+w telewizyjnym szeptance).
 
 > **Uwaga o autorstwie:** ten projekt został w całości zaprojektowany
 > i napisany przez **Claude (Anthropic)** — model Claude Fable 5 działający
@@ -13,10 +23,12 @@ lektorem (ducking, jak w telewizyjnym szeptance).
 ## Architektura
 
 ```
-aplikacje ──▶ [Nacelle Translator (PL)]  (wirtualny sink, media.class=Audio/Sink)
+aplikacje ──▶ [Nacelle Translator (PL)]  (smart filter, media.class=Audio/Sink)
+                    │  ▲ WirePlumber wpina nas tu sam, bo filtr jest
+                    │  │ „bezcelowy" (filter.smart bez filter.smart.target)
                     │ RT: ringbuffery SPSC (zero blokad w wątku danych)
                     ├─ passthrough stereo ────────────────────┐
-                    └─ downmix mono 48 kHz                    │
+                    └─ downmix mono 48 kHz  [audio].translate │
                          └─▶ rubato 48k→16k ─▶ Silero VAD     │ ducking
                               └─▶ segmenter (histereza,       │ (-14 dB pod
                                    hangover 800 ms,           │  lektorem)
@@ -24,9 +36,13 @@ aplikacje ──▶ [Nacelle Translator (PL)]  (wirtualny sink, media.class=Audi
                                    └─▶ whisper.cpp ─▶ llama-server ─▶ piper
                                      (STT, CUDA)    (tłumaczenie)   (głos pl)
                                                                     │
-         głośniki/słuchawki ◀── [nacelle-translator-out] ◀── mikser ┘
-                                 (strumień Playback → sprzęt)
+    AKTUALNE domyślne wyjście ◀── [nacelle-translator-out] ◀─ mikser ┘
+    (cel wybiera WirePlumber,       (strumień Playback, node.passive)
+     przepina bez restartu)
 ```
+
+Gałąź AI (od `rubato` w dół) rusza wyłącznie przy `[audio].translate = true`;
+przy `false` przez węzeł idzie sam passthrough.
 
 - **STT:** [whisper.cpp] przez `whisper-rs` (backend CUDA — feature `cuda`,
   model wielojęzyczny, autodetekcja języka źródłowego). Wymaga CUDA Toolkit
@@ -174,17 +190,18 @@ Apache/MIT.
 
 ```sh
 ./target/release/nacelle-translator check     # sprawdza model, pipera, Ollamę/klucz, PipeWire
-./target/release/nacelle-translator devices   # lista węzłów Audio/Sink (node.name do configu)
+./target/release/nacelle-translator devices   # lista węzłów Audio/Sink (podgląd grafu)
 ./target/release/nacelle-translator           # start; Ctrl+C kończy
 ```
 
-Potem ustaw „Nacelle Translator (PL)" jako wyjście dźwięku — w ustawieniach
-dźwięku KDE albo:
+**Nic więcej nie trzeba ustawiać.** Translator wpina się sam w to wyjście
+dźwięku, które masz aktualnie wybrane w KDE, i podąża za jego zmianami.
+Nie wybieraj go jako urządzenia wyjściowego — patrz „Urządzenie wyjściowe"
+niżej.
 
-```sh
-wpctl status                 # znajdź id sinka "Nacelle Translator (PL)"
-wpctl set-default <id>
-```
+Samo tłumaczenie jest domyślnie **wyłączone** (przelotka przepuszcza dźwięk
+bez zmian). Włącza je `translate = true` w sekcji `[audio]` — patrz
+„Tłumaczenie" niżej.
 
 Konfiguracja: skopiuj `nacelle-translator.toml.example` do `nacelle-translator.toml` (albo
 uruchamiaj bez pliku — obowiązują te same wartości domyślne). Tryb testowy
@@ -227,53 +244,77 @@ przypisać do wariantu, także wtedy, gdy wklejasz sam fragment. Wariant
 z opcjami leci na poziomie `WARN`, więc przeżywa `RUST_LOG=warn`; szczegółowy
 opis każdej włączonej opcji idzie osobną linią `INFO`.
 
-## Wybór urządzenia wyjściowego
+## Urządzenie wyjściowe: nic nie ustawiasz
 
-Bez `output_device` w konfiguracji program **odczytuje** (nigdy nie zapisuje)
-z metadanych PipeWire, jakie urządzenie masz **aktualnie ustawione jako
-domyślne wyjście** — to samo, co `wpctl status` pokazuje pod „Default
-Configured Devices" — i tam kieruje swój strumień odtwarzania. Program
-niczego w ustawieniach systemowych nie zmienia; jedyna zmiana, jaką trzeba
-wykonać ręcznie, to (jednorazowo) wybranie „Nacelle Translator (PL)" jako
-urządzenia wyjściowego w KDE albo przez `wpctl set-default` — PipeWire
-zapamiętuje ten wybór trwale, więc przy kolejnych uruchomieniach programu
-nie trzeba tego powtarzać.
+**Nie wybieraj translatora jako wyjścia dźwięku.** Wybierz swoje słuchawki,
+głośniki czy HDMI — tak jak zawsze, w Ustawieniach systemowych → Dźwięk albo
+`wpctl set-default <id>`. Translator wepnie się w ten tor sam.
 
-Uwaga na dwie rzeczy:
+Działa to, bo węzeł zgłasza się WirePlumberowi jako **inteligentny filtr bez
+zdefiniowanego celu** (`filter.smart = true`, bez `filter.smart.target`).
+Taki filtr wpina się w *aktualnie domyślne* wyjście, a gdy je zmienisz,
+WirePlumber przepina go razem z resztą — bez restartu programu. To ten sam
+mechanizm, z którego korzysta EasyEffects.
 
-- **Aplet głośności KDE UKRYWA węzeł translatora.** Ma `node.virtual=true`,
-  więc pipewire-pulse nie nadaje mu flagi `PA_SINK_HARDWARE`, a plasma-pa ma
-  `filterVirtualDevices` domyślnie włączone. Wybierzesz go przez
-  `wpctl set-default <ID>` (ID z `nacelle-translator devices`) albo
-  w Ustawienia → Dźwięk → Aplikacje, przenosząc konkretną aplikację.
-- **Cel odtwarzania jest ustalany RAZ, przy starcie, i nie podąża za
-  apletem.** Zmiana domyślnego wyjścia w KDE w trakcie pracy nie przepnie
-  translatora — dostaniesz w logu ostrzeżenie z obiema nazwami i trzeba
-  zrestartować program. Wynika to z `DONT_RECONNECT` + `node.link-group`,
-  które wyłączają mechanizm „follow default" WirePlumbera; to ta sama para
-  właściwości, która chroni przed pętlą (niżej).
+Konsekwencje, o których warto wiedzieć:
+
+- **Zmiana urządzenia w trakcie pracy jest ścieżką normalną.** Przełączanie
+  słuchawek/głośników w aplecie nie kończy translatora i nie wymaga
+  restartu; w logu zobaczysz `INFO domyślne wyjście dźwięku zmieniono na …
+  — przelotka podąża za tym wyborem sama`.
+- **Aplet głośności KDE ukrywa węzeł translatora** (`node.virtual = true`
+  + `filterVirtualDevices` w plasma-pa) — i to jest zamierzone. Przelotka nie
+  jest urządzeniem do wybrania.
+- **Jeśli mimo to ustawisz translator jako domyślne wyjście, ucichnie.**
+  Jego własny strumień odtwarzania trafiłby wtedy z powrotem na niego samego,
+  a WirePlumber słusznie odmawia takiego linkowania. Program tego **nie
+  naprawia sam** — nie nadpisuje ustawień dźwięku użytkownika — tylko krzyczy
+  w logu (`ERROR domyślnym wyjściem dźwięku jest NASZ własny węzeł …`)
+  i podaje nazwę urządzenia do wybrania. Wykrywa to też `check`.
+- Klucz `[audio].output_device` jest **wycofany** i nic nie robi. Zostaje
+  przyjmowany, żeby stare pliki konfiguracyjne dalej się wczytywały; program
+  raz ostrzega w logu i prosi o usunięcie linii.
+
+## Tłumaczenie: włącznik `[audio].translate`
+
+Przelotka stoi w torze **całego** dźwięku systemu, więc mielenie wszystkiego
+przez AI musi być świadomym wyborem, a nie zachowaniem domyślnym:
+
+```toml
+[audio]
+translate = true    # domyślnie false
+```
+
+- `false` (domyślnie) — węzeł jest czystą przelotką. Dźwięk przechodzi
+  bez zmian, tor AI nie dostaje ani jednej próbki, GPU stoi.
+- `true` — do VAD trafia wszystko, co przez przelotkę leci: gra,
+  powiadomienie, muzyka. Whisper miele to na GPU, lektor odzywa się w środku
+  rozgrywki, a ducking ścisza **cały** system o ~14 dB przy każdej jego
+  wypowiedzi — także wtedy, gdy tłumaczy zupełnie inną aplikację.
+
+Tryb pracy jest wypisywany w logu przy każdym starcie i przez `check`.
 
 ## Zabezpieczenie przed pętlą
 
-Gdy „Nacelle Translator (PL)" jest domyślnym wyjściem, strumień wyjściowy
-translatora **nie może** trafić z powrotem do niego. Chronią przed tym:
+Gdy strumień wyjściowy translatora miałby trafić z powrotem do jego własnego
+sinka, chronią przed tym:
 
-- `target.object` wskazujący konkretny sprzętowy `node.name`, **razem
-  z `node.dont-fallback=true`**. Sam `target.object` jest tylko sugestią —
-  gdy dopasowanie nie trafi, WirePlumber przechodzi dalej, aż do domyślnego
-  sinka, którym bywa właśnie translator. `node.dont-fallback` każe mu
-  zamiast tego zgłosić błąd i zniszczyć nasz węzeł, co program zamienia
-  w głośne zakończenie z instrukcją. Koszt: wyłączenie urządzenia
-  wyjściowego (np. słuchawek) kończy translator — świadomie, bo alternatywą
-  było ciche granie w próżnię bez jednego wiersza w logu.
-- wspólna `node.link-group` na obu węzłach (wzorzec z `module-loopback`) —
-  WirePlumber odmawia linkowania węzłów o tej samej wartości i rekurencyjnie
-  wykrywa pętle pośrednie;
-- `DONT_RECONNECT` — po pierwszym udanym zlinkowaniu strumień nie jest
-  przepinany na inny cel;
-- przy automatycznym wyborze celu odfiltrowywane są własne węzły i wszystkie
-  obce wirtualne sinki (akceptowany jest tylko sprzęt `alsa_output.*`
-  / `bluez_output.*`).
+- **wspólna `node.link-group` na obu węzłach** — jedyny zamek niezależny od
+  jakiejkolwiek naszej decyzji o celu: WirePlumber odmawia linkowania węzłów
+  o tej samej wartości i rekurencyjnie (do 8 hopów) wykrywa pętle pośrednie.
+  Sprawdzane na każdej ścieżce wyboru celu, także przy celu domyślnym;
+- **pomijanie inteligentnych filtrów jako celów** — WirePlumber nie wskaże
+  jednego smart-filtra jako celu drugiego, więc nie wpiszemy się w siebie ani
+  w EasyEffects „na krzyż";
+- **wykrycie i głośny komunikat** w jedynym przypadku, którego nie da się
+  zablokować od strony programu: gdy użytkownik ustawi translator jako
+  domyślne wyjście (opis wyżej).
+
+Czego tu **celowo nie ma**, a bywało wcześniej: `target.object`
+i `node.dont-fallback` (przypinały do jednego sprzętu i kazały WirePlumberowi
+niszczyć nasz węzeł) oraz `DONT_RECONNECT` (po pierwszym zlinkowaniu filtr
+nigdy nie przeniósłby się na nowe wyjście — wprost sprzecznie z modelem
+przelotki).
 
 ## Diagnostyka w logu
 
@@ -281,13 +322,20 @@ Domyślny poziom to `info`; `-v` podnosi do `debug`. Co warto rozpoznać:
 
 - `WARN przepełnienie ringów RT ...` — tor AI albo odtwarzanie nie nadąża
   i próbki przepadają. Przy zdrowej pracy ta linia nie pada w ogóle.
-- `WARN domyślne wyjście dźwięku zmieniono na ... ale translator gra dalej
-  w ...` — przełączyłeś urządzenie w KDE; zrestartuj translator.
+- `INFO domyślne wyjście dźwięku zmieniono na ... — przelotka podąża za tym
+  wyborem sama` — przełączyłeś urządzenie w KDE i wszystko jest w porządku;
+  demon żyje dalej, restart nie jest potrzebny.
+- `ERROR domyślnym wyjściem dźwięku jest NASZ własny węzeł ...` — ustawiłeś
+  translator jako wyjście dźwięku. Wybierz swój prawdziwy sprzęt (komunikat
+  podaje jego nazwę); do tego czasu translator jest niemy.
 - `WARN <strumień>: błąd sesyjny od serwera ...` — rutynowy komunikat
-  WirePlumbera (zwykle „no target node available"); program pracuje dalej,
-  komunikat jest dławiony do jednego na 10 s.
-- `ERROR ... węzeł wypadł z grafu — cel odtwarzania "..." zniknął` — koniec
-  pracy; urządzenie wyjściowe przepadło.
+  WirePlumbera (zwykle „no target node available"), typowy w trakcie
+  przepinania urządzenia; program pracuje dalej, komunikat jest dławiony
+  do jednego na 10 s.
+- `ERROR ... węzeł wypadł z grafu — serwer PipeWire zniszczył nasz węzeł` —
+  koniec pracy; padło połączenie z demonem. To NIE jest reakcja na zniknięcie
+  urządzenia: przejściowy brak celu (przełączanie profilu karty, uśpione
+  słuchawki) jest ścieżką normalną i kończy się `WARN`-em wyżej.
 - `DEBUG passthrough: zaległość min/max/ost. ... (kwant ...)` — przyrząd
   pomiarowy toru RT, widoczny tylko z `-v`. Służy do dobrania rozmiaru
   bufora wstępnego; nie wpływa na ani jedną próbkę.
