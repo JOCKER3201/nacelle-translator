@@ -4,6 +4,7 @@
 //!
 //! Podkomendy: run (domyślna), devices, check.
 
+mod agreement;
 mod audio;
 mod config;
 mod pipeline;

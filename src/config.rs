@@ -93,6 +93,21 @@ pub struct SttCfg {
     /// "auto" albo kod języka źródłowego, np. "en"
     pub language: String,
     pub threads: i32,
+    /// spekulacyjne STT: whisper puszczany co cadence_ms CZASU AUDIO na
+    /// rosnącym, otwartym segmencie; stabilny prefiks (LocalAgreement-2)
+    /// idzie do tłumaczenia od razu, final domyka tylko ogon
+    pub speculative: bool,
+    /// kadencja przebiegów częściowych [ms czasu audio] — liczona chunkami
+    /// segmentera (32 ms), nie zegarem ściennym: zegar ścienny kłamie przy
+    /// wstrzykiwanej ciszy i zaległościach resamplera
+    pub cadence_ms: u32,
+    /// poniżej tej długości otwartego bufora nie spekulujemy: pad zerowy
+    /// whispera (MIN_SAMPLES = 1,1 s) daje na krótkim audio skorelowane
+    /// halucynacje, które LocalAgreement błędnie uznałby za stabilne
+    pub min_open_ms: u32,
+    /// minimalna długość fragmentu w znakach (do interpunkcji frazowej);
+    /// krótsze fragmenty czekają na kolejny przebieg
+    pub min_fragment_chars: usize,
 }
 
 impl Default for SttCfg {
@@ -101,6 +116,10 @@ impl Default for SttCfg {
             model: "models/ggml-small.bin".into(),
             language: "auto".into(),
             threads: 8,
+            speculative: false,
+            cadence_ms: 400,
+            min_open_ms: 1500,
+            min_fragment_chars: 12,
         }
     }
 }
