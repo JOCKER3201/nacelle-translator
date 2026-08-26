@@ -917,12 +917,23 @@ fn synth_with_restart(
 /// ZEGARA GRAFU: zawieszony serwer PipeWire, freewheeling, węzeł uśpiony
 /// z zewnątrz. NIE chroni przed utratą celu odtwarzania. Odlinkowany węzeł
 /// dalej dostaje `process()` („normally idle nodes keep processing",
-/// man 7 pipewire-props; monitors/suspend-node.lua filtruje `Audio/*`, więc
+/// man 7 pipewire-props; node/suspend-node.lua filtruje `Audio/*`, więc
 /// naszego `Stream/Output/Audio` nie usypia), więc ring DALEJ się drenuje,
 /// `push_slice` dalej zwraca `n > 0` i zatrzask nigdy nie zadziała — mowa
 /// lektora jest wtedy po cichu zjadana przez węzeł grający w próżnię.
-/// Utratę celu wykrywa `node.dont-fallback` + strażnik `verdict` w pw.rs,
-/// i to jest jedyne miejsce, które ją wykrywa.
+///
+/// UTRATA CELU NIE JEST DZIŚ WYKRYWANA NIGDZIE — i tak ma być. W modelu
+/// przelotki (pw.rs) przejściowy brak celu to ścieżka NORMALNA: zdarza się
+/// przy każdym przełączeniu urządzenia i przy każdym uśpieniu słuchawek,
+/// a demon ma to przeżyć dowolną liczbę razy. Dawny czujnik
+/// (`node.dont-fallback`) został usunięty, bo przy `filter.smart` kazał
+/// WirePlumberowi NISZCZYĆ nasz węzeł (find-filter-target.lua, gałąź
+/// `is_smart_filter and dont_fallback`: `sendClientError` +
+/// `node:request_destroy()`). Cena tej zmiany, wpisana tu wprost, żeby nikt
+/// jej nie odkrywał od nowa: w oknie bez zlinkowanego celu mowa lektora
+/// przepada po cichu i nie zwiększa `dropped_finals`. Gdyby kiedyś była
+/// potrzebna obserwowalność tego okna, właściwym narzędziem jest osobny
+/// licznik „cykli odtwarzania bez celu", a nie przywracanie dont-fallback.
 const TTS_PUSH_STALL_BUDGET: Duration = Duration::from_secs(10);
 /// Jak często meldować o porzucaniu, dopóki zatrzask trwa (jeden zbiorczy
 /// komunikat zamiast jednego na każdy klip).

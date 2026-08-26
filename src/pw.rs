@@ -347,6 +347,92 @@ impl DuckParams {
     }
 }
 
+/// [RT] Downmiks do mono i podanie go torowi AI. Zwraca liczbę próbek, które
+/// NIE zmieściły się w ringu (0 = wszystko przeszło albo bramka zamknięta).
+///
+/// Wydzielone z callbacku sinka wyłącznie po to, żeby dało się to
+/// PRZETESTOWAĆ. Twierdzenie commita bramkowego — „przy zamkniętej bramce
+/// pomijamy CAŁOŚĆ, także sam downmiks" — żyło wcześniej w domknięciu
+/// nieosiągalnym z testów, więc pilnowało go tylko czyjeś oko.
+///
+/// `stereo` jest interleaved (FL, FR, FL, FR, …); `mono` musi mieć miejsce na
+/// `stereo.len() / CHANNELS` próbek.
+#[inline]
+fn feed_ai(
+    gate: TranslateGate,
+    stereo: &[f32],
+    mono: &mut [f32],
+    cap_prod: &mut HeapProd<f32>,
+) -> usize {
+    if !gate.feeds_ai() {
+        return 0;
+    }
+    let frames = stereo.len() / CHANNELS;
+    for f in 0..frames {
+        mono[f] = (stereo[f * 2] + stereo[f * 2 + 1]) * 0.5;
+    }
+    frames - cap_prod.push_slice(&mono[..frames])
+}
+
+/// [RT] Zmieszanie jednego kawałka: oryginał (przyciszany pod lektorem)
+/// plus lektor. Wszystko interleaved stereo poza `tts`, który jest mono.
+///
+/// `gain` i `hold` to STAN CIĄGŁY obwiedni duckingu — przechodzą przez
+/// granice kawałków i cykli, więc są przekazywane przez `&mut`, a nie
+/// zwracane.
+///
+/// Bramka jest sprawdzana także TUTAJ, mimo że wołający i tak nie drenuje
+/// ringu TTS przy zamkniętej bramce. To nie jest podwójna robota, tylko
+/// jedyny sposób, żeby dało się przetestować zdanie „ducking ani razu się
+/// nie odpali": test podaje niezerowy `tts` przy zamkniętej bramce
+/// i sprawdza, że wyjście jest bit w bit oryginałem.
+#[inline]
+fn mix_chunk(
+    gate: TranslateGate,
+    duck: &DuckParams,
+    gain: &mut f32,
+    hold: &mut u32,
+    pass: &[f32],
+    tts: &[f32],
+    out: &mut [f32],
+) {
+    let tts: &[f32] = if gate.plays_tts() { tts } else { &[] };
+    let frames = out.len() / CHANNELS;
+    let pass_frames = pass.len() / CHANNELS;
+    for j in 0..frames {
+        let has_tts = j < tts.len();
+        // Duck zawsze, gdy TTS gra TERAZ; poza tym trzymaj przyciszenie
+        // jeszcze `hold_frames` po jego końcu. (Warunek musi sprawdzać
+        // `has_tts` wprost — samo "hold > 0" ustawione w tej samej iteracji,
+        // w której hold właśnie przypisano, prowadziłoby przy
+        // hold_frames == 0 do duckingu, który nigdy się nie uruchamia.)
+        let target_gain = if has_tts {
+            *hold = duck.hold_frames;
+            duck.duck_gain
+        } else if *hold > 0 {
+            *hold -= 1;
+            duck.duck_gain
+        } else {
+            duck.pass_gain
+        };
+        let coef = if target_gain < *gain {
+            duck.attack_coef
+        } else {
+            duck.release_coef
+        };
+        *gain += (target_gain - *gain) * coef;
+
+        let (pl, pr) = if j < pass_frames {
+            (pass[j * 2], pass[j * 2 + 1])
+        } else {
+            (0.0, 0.0) // underrun passthrough => cisza
+        };
+        let t = if has_tts { tts[j] * duck.tts_gain } else { 0.0 };
+        out[j * 2] = soft_clip(pl * *gain + t);
+        out[j * 2 + 1] = soft_clip(pr * *gain + t);
+    }
+}
+
 /// Miękki limiter: identyczność poniżej progu, asymptotyczne podejście do
 /// ±1.0 powyżej — zamiast twardego obcięcia (flat-top, słyszalny trzask),
 /// które przy głośnym oryginale + starcie lektora potrafi wystąpić na
@@ -1182,16 +1268,14 @@ pub fn run_graph(
                 // Przy zamkniętej bramce pomijamy CAŁOŚĆ (także sam downmix):
                 // przelotka ma wtedy kosztować tyle co przepisanie próbek,
                 // a nie tyle co przepisanie plus pętla mnożeń na darmo.
-                if st.gate.feeds_ai() {
-                    let frames = nsamples / CHANNELS;
-                    for f in 0..frames {
-                        st.mono[f] = (st.stereo[f * 2] + st.stereo[f * 2 + 1]) * 0.5;
-                    }
-                    let pushed = st.cap_prod.push_slice(&st.mono[..frames]);
-                    if pushed < frames {
-                        st.cap_dropped
-                            .fetch_add((frames - pushed) as u64, Ordering::Relaxed);
-                    }
+                let lost = feed_ai(
+                    st.gate,
+                    &st.stereo[..nsamples],
+                    &mut st.mono,
+                    &mut st.cap_prod,
+                );
+                if lost > 0 {
+                    st.cap_dropped.fetch_add(lost as u64, Ordering::Relaxed);
                 }
                 pos += nbytes;
             }
@@ -1330,44 +1414,15 @@ pub fn run_graph(
                         0
                     };
 
-                    for j in 0..n {
-                        let has_tts = j < got_tts;
-                        // Duck zawsze, gdy TTS gra TERAZ; poza tym trzymaj
-                        // przyciszenie jeszcze `hold_frames` po jego końcu.
-                        // (Warunek musi sprawdzać `has_tts` wprost — samo
-                        // "hold > 0" ustawione w tej samej iteracji, w
-                        // której hold właśnie przypisano, prowadziłoby przy
-                        // hold_frames == 0 do duckingu, który nigdy się nie
-                        // uruchamia.)
-                        let target_gain = if has_tts {
-                            st.hold = st.duck.hold_frames;
-                            st.duck.duck_gain
-                        } else if st.hold > 0 {
-                            st.hold -= 1;
-                            st.duck.duck_gain
-                        } else {
-                            st.duck.pass_gain
-                        };
-                        let coef = if target_gain < st.gain {
-                            st.duck.attack_coef
-                        } else {
-                            st.duck.release_coef
-                        };
-                        st.gain += (target_gain - st.gain) * coef;
-
-                        let (pl, pr) = if j < got_pass_frames {
-                            (st.pass_scratch[j * 2], st.pass_scratch[j * 2 + 1])
-                        } else {
-                            (0.0, 0.0) // underrun passthrough => cisza
-                        };
-                        let t = if has_tts {
-                            st.tts_scratch[j] * st.duck.tts_gain
-                        } else {
-                            0.0
-                        };
-                        out[(fi + j) * 2] = soft_clip(pl * st.gain + t);
-                        out[(fi + j) * 2 + 1] = soft_clip(pr * st.gain + t);
-                    }
+                    mix_chunk(
+                        st.gate,
+                        &st.duck,
+                        &mut st.gain,
+                        &mut st.hold,
+                        &st.pass_scratch[..got_pass_frames * CHANNELS],
+                        &st.tts_scratch[..got_tts],
+                        &mut out[fi * CHANNELS..(fi + n) * CHANNELS],
+                    );
                     fi += n;
                 }
             }
@@ -1774,16 +1829,128 @@ default.configured.audio.sink.1=alsa_output.pci-0000_73_00.6.analog-stereo
         assert!(g.plays_tts());
     }
 
-    #[test]
-    fn b3_obie_decyzje_zawsze_zgodne() {
-        // NIEZMIENNIK: nigdy „karm AI, nie graj lektora" (praca GPU bez
-        // efektu) ani „graj lektora, nie karm AI" (ducking pod resztkę mowy
-        // z ringu, bez powiązanego oryginału). Rozjazd nie wywala programu,
-        // więc bez tego testu byłby cichy.
-        for on in [false, true] {
-            let g = TranslateGate::new(on);
-            assert_eq!(g.feeds_ai(), g.plays_tts(), "rozjazd bramki dla on={on}");
+    /// Parametry duckingu do testów: `pass_gain` != 1.0 i `duck_gain` daleko
+    /// od niego, żeby pomylenie jednego z drugim nie przeszło niezauważone,
+    /// a współczynniki 1.0 (natychmiastowe dojście do celu), żeby test nie
+    /// mierzył kształtu obwiedni, tylko to, czy w ogóle się odpaliła.
+    fn duck_testowy() -> DuckParams {
+        DuckParams {
+            pass_gain: 0.5,
+            duck_gain: 0.1,
+            tts_gain: 1.0,
+            attack_coef: 1.0,
+            release_coef: 1.0,
+            hold_frames: 3,
         }
+    }
+
+    #[test]
+    fn b3_zamknieta_bramka_nie_odpala_duckingu_mimo_probek_w_ringu() {
+        // TO jest twierdzenie, które commit bramkowy postawił, a którego nie
+        // pilnował ŻADEN test: „got_tts = 0, więc ducking się nie odpala".
+        // Poprzednie b3 porównywało dwie metody czytające to samo pole jednej
+        // struktury — przechodziło z definicji i nie mogło wykryć klasy błędu,
+        // dla której powstało (pomyłka w MIEJSCU UŻYCIA bramki).
+        //
+        // Tu podajemy niezerowego lektora przy ZAMKNIĘTEJ bramce. Gdyby
+        // ducking się odpalił, ścisząłby CAŁY dźwięk systemu o ~14 dB.
+        let duck = duck_testowy();
+        let mut gain = duck.pass_gain;
+        let mut hold = 0u32;
+        let pass = [0.2, -0.2, 0.4, -0.4];
+        let tts = [0.9, 0.9];
+        let mut out = [0.0f32; 4];
+        mix_chunk(
+            TranslateGate::new(false),
+            &duck,
+            &mut gain,
+            &mut hold,
+            &pass,
+            &tts,
+            &mut out,
+        );
+        // wyjście = sam oryginał przemnożony przez pass_gain, bez śladu lektora
+        for (i, o) in out.iter().enumerate() {
+            assert!(
+                (o - pass[i] * duck.pass_gain).abs() < 1e-6,
+                "zamknięta bramka zmieniła próbkę {i}: {o}"
+            );
+        }
+        assert_eq!(gain, duck.pass_gain, "wzmocnienie nie miało prawa drgnąć");
+        assert_eq!(hold, 0, "zatrzymanie duckingu nie miało prawa się uzbroić");
+    }
+
+    #[test]
+    fn b3b_otwarta_bramka_duckuje_i_dodaje_lektora() {
+        // Druga strona tego samego niezmiennika: sprawdzamy, że przy otwartej
+        // bramce nic nie zostało zepsute po drodze. Bez tego test wyżej dałoby
+        // się „naprawić" wyłączając ducking na stałe.
+        let duck = duck_testowy();
+        let mut gain = duck.pass_gain;
+        let mut hold = 0u32;
+        let pass = [0.2, -0.2, 0.4, -0.4];
+        let tts = [0.3, 0.3];
+        let mut out = [0.0f32; 4];
+        mix_chunk(
+            TranslateGate::new(true),
+            &duck,
+            &mut gain,
+            &mut hold,
+            &pass,
+            &tts,
+            &mut out,
+        );
+        assert_eq!(gain, duck.duck_gain, "przy graniu lektora ma być duck_gain");
+        assert_eq!(hold, duck.hold_frames, "zatrzask przyciszenia ma być uzbrojony");
+        // oryginał przyciszony + lektor dodany
+        assert!((out[0] - (0.2 * duck.duck_gain + 0.3)).abs() < 1e-6, "{}", out[0]);
+    }
+
+    #[test]
+    fn b3c_underrun_passthrough_to_cisza_nie_smieci() {
+        // Gdy ring passthrough nie nadążył, brakujące ramki mają być ciszą,
+        // a nie resztką poprzedniego kawałka ze scratchu.
+        let duck = duck_testowy();
+        let mut gain = duck.pass_gain;
+        let mut hold = 0u32;
+        let mut out = [7.0f32; 6]; // celowo śmieci na wejściu
+        mix_chunk(
+            TranslateGate::new(false),
+            &duck,
+            &mut gain,
+            &mut hold,
+            &[0.2, 0.2], // tylko jedna ramka oryginału na trzy żądane
+            &[],
+            &mut out,
+        );
+        assert!((out[0] - 0.2 * duck.pass_gain).abs() < 1e-6);
+        assert_eq!(&out[2..], &[0.0; 4], "brakujące ramki muszą być ciszą");
+    }
+
+    #[test]
+    fn b3d_zamknieta_bramka_nie_rusza_downmiksu_ani_ringu() {
+        // Commit bramkowy deklaruje, że przy zamkniętej bramce pomijamy
+        // CAŁOŚĆ — także sam downmiks, nie tylko `push_slice`. Bez tego testu
+        // to zdanie nie było niczym poparte.
+        let (mut prod, cons) = ringbuf::HeapRb::<f32>::new(16).split();
+        let stereo = [1.0, 1.0, 1.0, 1.0];
+        let mut mono = [-1.0f32; 2];
+        let lost = feed_ai(TranslateGate::new(false), &stereo, &mut mono, &mut prod);
+        assert_eq!(lost, 0);
+        assert_eq!(mono, [-1.0, -1.0], "downmiks nie miał prawa się wykonać");
+        assert_eq!(cons.occupied_len(), 0, "ring toru AI ma zostać pusty");
+    }
+
+    #[test]
+    fn b3e_otwarta_bramka_downmiksuje_i_liczy_zgubione() {
+        let (mut prod, cons) = ringbuf::HeapRb::<f32>::new(2).split();
+        // 3 ramki stereo, w ringu miejsce na 2 próbki mono => jedna przepada
+        let stereo = [1.0, 0.0, 0.5, 0.5, 0.2, 0.8];
+        let mut mono = [0.0f32; 3];
+        let lost = feed_ai(TranslateGate::new(true), &stereo, &mut mono, &mut prod);
+        assert_eq!(mono, [0.5, 0.5, 0.5], "downmiks to średnia obu kanałów");
+        assert_eq!(cons.occupied_len(), 2);
+        assert_eq!(lost, 1, "nadmiar musi trafić do licznika porzuceń");
     }
 
     #[test]
