@@ -52,7 +52,10 @@ soft_max_ms = 2000       # od tej długości: (1) szukamy dołka do cięcia,
                          # Uruchamiając z --experimental-futures=speculative-stt
                          # opłaca się 6000 — niskie opóźnienie dają wtedy
                          # fragmenty, a final może poczekać na pełniejsze zdanie
-                         # i dać tłumaczowi lepszy kontekst.
+                         # i dać tłumaczowi lepszy kontekst. Wartość powyżej
+                         # 3000 na torze BEZ spekulacji program zgłasza linią
+                         # WARN na starcie (i w `check`), bo to najczęstszy
+                         # sposób, w jaki plik zostaje po drugim wariancie.
 hard_max_ms = 8000       # twarde cięcie ciągłej mowy — sufit awaryjny, gdy nie
                          # trafi się żadna pauza ani dołek
 overlap_ms = 250         # nakładka przenoszona po wymuszonym cięciu

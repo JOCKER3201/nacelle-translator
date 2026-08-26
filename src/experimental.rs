@@ -7,18 +7,24 @@
 //! eksperymentalnym. Flaga w wierszu poleceń jest widoczna w `ps`, w historii
 //! powłoki i w logu startowym, więc przebieg da się jednoznacznie odtworzyć.
 //!
-//! DODANIE KOLEJNEJ OPCJI = JEDEN wpis w tablicy [`FEATURES`] i nic więcej:
-//! nazwa, opis (leci do `--help` i do podkomendy `check`) oraz domknięcie
-//! przestawiające pole w [`Config`]. Parser, walidacja, `--help`, `check`
-//! i log startowy czytają tę tablicę, więc żaden z nich nie wymaga zmiany.
-//! Reszta programu (pipeline) widzi wyłącznie gotową konfigurację i nie wie
-//! nawet, że flaga istnieje.
+//! DODANIE KOLEJNEJ OPCJI = JEDEN wpis w tablicy [`FEATURES`]: nazwa, opis
+//! (leci do `--help` i do podkomendy `check`) oraz domknięcie przestawiające
+//! pole w [`Config`]. Parser, walidacja, `--help`, `check` i log startowy
+//! czytają tę tablicę, więc żaden z nich nie wymaga zmiany. Reszta programu
+//! (pipeline) widzi wyłącznie gotową konfigurację i nie wie nawet, że flaga
+//! istnieje. README opisuje szerzej WYŁĄCZNIE te opcje, które wymagają
+//! dostrojenia kluczami TOML — krótka wersja opisu żyje tutaj i w `--help`.
 
 use crate::config::Config;
 
 /// Nazwa flagi w jednym miejscu — używana też w komunikatach błędów.
+///
+/// Pisownia `futures` (a nie `features`) jest CELOWA i nie jest literówką do
+/// poprawienia w dobrej wierze: nazwa flagi to publiczny interfejs programu,
+/// więc jej zmiana psuje każdy istniejący alias i skrypt.
 pub const FLAG: &str = "--experimental-futures";
 
+#[derive(Debug)]
 pub struct Feature {
     /// nazwa podawana po przecinku w `--experimental-futures=`
     pub name: &'static str,
@@ -39,14 +45,31 @@ pub const FEATURES: &[Feature] = &[Feature {
 }];
 
 /// Zbiór opcji włączonych flagą — w kolejności pierwszego wystąpienia.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Selection {
-    /// indeksy w [`FEATURES`]; indeks zamiast nazwy, żeby „włączona" i
-    /// „istniejąca" opcja były z definicji tym samym
+    /// tablica, względem której interpretowane są indeksy — w programie
+    /// zawsze [`FEATURES`]. Jest polem, a nie stałą wołaną wprost, bo
+    /// produkcyjna tablica ma dziś JEDEN wpis: bez atrapy z kilkoma opcjami
+    /// testy listy po przecinku degenerują się do testu jednej nazwy i
+    /// przepuściłyby parser obsługujący wyłącznie pierwszy element.
+    features: &'static [Feature],
+    /// indeksy w [`Selection::features`]; indeks zamiast nazwy, żeby
+    /// „włączona" i „istniejąca" opcja były z definicji tym samym
     enabled: Vec<usize>,
 }
 
+impl Default for Selection {
+    fn default() -> Self {
+        Self { features: FEATURES, enabled: Vec::new() }
+    }
+}
+
 impl Selection {
+    #[cfg(test)]
+    fn with_features(features: &'static [Feature]) -> Self {
+        Self { features, enabled: Vec::new() }
+    }
+
     /// Dokłada opcje z jednego wystąpienia flagi (wartość bez nazwy flagi).
     ///
     /// Powtórzenie flagi SUMUJE zbiory zamiast być błędem: opcje i tak są
@@ -56,9 +79,9 @@ impl Selection {
     /// Duplikat tej samej nazwy też przechodzi (idempotencja włączania).
     pub fn extend_from_spec(&mut self, spec: &str) -> Result<(), String> {
         if spec.trim().is_empty() {
+            let example = self.features.first().map(|f| f.name).unwrap_or("nazwa-opcji");
             return Err(format!(
-                "{FLAG} wymaga listy opcji oddzielonych przecinkami (np. {FLAG}={})",
-                FEATURES[0].name
+                "{FLAG} wymaga listy opcji oddzielonych przecinkami (np. {FLAG}={example})"
             ));
         }
         for raw in spec.split(',') {
@@ -71,7 +94,7 @@ impl Selection {
             if name.is_empty() {
                 return Err(format!("{FLAG}: pusta nazwa opcji (zbędny przecinek?)"));
             }
-            match FEATURES.iter().position(|f| f.name == name) {
+            match self.features.iter().position(|f| f.name == name) {
                 Some(i) => {
                     if !self.enabled.contains(&i) {
                         self.enabled.push(i);
@@ -88,7 +111,7 @@ impl Selection {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &'static Feature> + '_ {
-        self.enabled.iter().map(|&i| &FEATURES[i])
+        self.enabled.iter().map(|&i| &self.features[i])
     }
 
     pub fn names(&self) -> Vec<&'static str> {
@@ -102,13 +125,22 @@ impl Selection {
         }
     }
 
-    /// Linia INFO na starcie — w logu z sesji musi być widać gołym okiem,
-    /// czy przebieg szedł torem eksperymentalnym (dwa warianty tego samego
-    /// materiału inaczej są nie do odróżnienia po samych logach).
+    /// Linia startowa ZAWSZE, w OBU wariantach — w logu z sesji musi być
+    /// widać gołym okiem, czy przebieg szedł torem eksperymentalnym.
+    ///
+    /// Milczenie przy pustym zbiorze byłoby rozróżnianiem po NIEOBECNOŚCI
+    /// linii, a brak linii jest nie do odróżnienia od logu uciętego na
+    /// starcie, wklejonego od połowy sesji albo zebranego ze starszej
+    /// binarki — czyli dokładnie tego, co wykłada analizę nagrań.
+    /// Wariant eksperymentalny leci dodatkowo na WARN, bo `RUST_LOG=warn`
+    /// w środowisku wyciąłby znacznik akurat tam, gdzie jest najważniejszy;
+    /// „jedziesz kodem eksperymentalnym" to zresztą uczciwe ostrzeżenie.
     pub fn log_startup(&self) {
         if self.is_empty() {
+            log::info!("OPCJE EKSPERYMENTALNE: brak");
             return;
         }
+        log::warn!("OPCJE EKSPERYMENTALNE: {}", self.names().join(", "));
         for f in self.iter() {
             log::info!("OPCJA EKSPERYMENTALNA: {} — {}", f.name, f.help);
         }
@@ -159,6 +191,58 @@ fn wrap_help(help: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Atrapa tablicy opcji. Produkcyjna [`FEATURES`] ma dziś jeden wpis,
+    /// więc testy „listy po przecinku" i „sumowania" liczone na niej nie
+    /// dotykają ani przecinka, ani drugiej opcji — przeszedłby je parser
+    /// obsługujący wyłącznie pierwszy element listy. Każda atrapa przestawia
+    /// INNE pole konfiguracji, żeby było widać, że zadziałały wszystkie.
+    const TEST_FEATURES: &[Feature] = &[
+        Feature { name: "aaa", help: "atrapa a", enable: |cfg| cfg.stt.speculative = true },
+        Feature { name: "bbb", help: "atrapa b", enable: |cfg| cfg.stt.threads = 3 },
+        Feature { name: "ccc", help: "atrapa c", enable: |cfg| cfg.tts.sentence_silence = 0.5 },
+    ];
+
+    #[test]
+    fn lista_wielu_opcji_wlacza_wszystkie() {
+        let mut sel = Selection::with_features(TEST_FEATURES);
+        sel.extend_from_spec("aaa,bbb,ccc").unwrap();
+        assert_eq!(sel.names(), vec!["aaa", "bbb", "ccc"]);
+        let mut cfg = Config::default();
+        sel.apply(&mut cfg);
+        assert!(cfg.stt.speculative, "pierwsza opcja z listy");
+        assert_eq!(cfg.stt.threads, 3, "środkowa opcja z listy");
+        assert_eq!(cfg.tts.sentence_silence, 0.5, "ostatnia opcja z listy");
+    }
+
+    #[test]
+    fn kolejnosc_wynika_z_pierwszego_wystapienia() {
+        let mut sel = Selection::with_features(TEST_FEATURES);
+        sel.extend_from_spec("ccc,aaa").unwrap();
+        assert_eq!(sel.names(), vec!["ccc", "aaa"], "kolejność podania, nie kolejność tablicy");
+        let mut sel = Selection::with_features(TEST_FEATURES);
+        sel.extend_from_spec("aaa,bbb,aaa").unwrap();
+        assert_eq!(sel.names(), vec!["aaa", "bbb"], "powtórka w jednej liście nie dubluje");
+    }
+
+    #[test]
+    fn powtorzona_flaga_sumuje_rozne_opcje() {
+        let mut sel = Selection::with_features(TEST_FEATURES);
+        sel.extend_from_spec("aaa").unwrap();
+        sel.extend_from_spec("ccc,bbb").unwrap();
+        assert_eq!(sel.names(), vec!["aaa", "ccc", "bbb"], "drugie wystąpienie flagi dokłada");
+        sel.extend_from_spec("aaa").unwrap();
+        assert_eq!(sel.names(), vec!["aaa", "ccc", "bbb"], "duplikat między flagami nie dubluje");
+    }
+
+    #[test]
+    fn nieznana_nazwa_w_srodku_listy_to_blad() {
+        // element PO poprawnej nazwie — pilnuje, że walidacja idzie przez
+        // całą listę, a nie kończy się na pierwszym trafieniu
+        let mut sel = Selection::with_features(TEST_FEATURES);
+        let e = sel.extend_from_spec("aaa,zzz,bbb").unwrap_err();
+        assert!(e.contains("zzz"), "komunikat musi cytować złą nazwę: {e}");
+    }
+
     #[test]
     fn brak_flagi_nic_nie_wlacza() {
         let sel = Selection::default();
@@ -200,8 +284,11 @@ mod tests {
 
     #[test]
     fn puste_wartosci_miedzy_przecinkami_to_blad() {
-        for spec in ["speculative-stt,,speculative-stt", "speculative-stt,", ",speculative-stt"] {
-            let mut sel = Selection::default();
+        // nazwy wokół pustego elementu są POPRAWNE (atrapa), więc pętla
+        // naprawdę dochodzi do zbędnego przecinka zamiast wywracać się już
+        // na pierwszym elemencie
+        for spec in ["aaa,,bbb", "aaa,", ",aaa", "aaa, ,bbb"] {
+            let mut sel = Selection::with_features(TEST_FEATURES);
             let e = sel.extend_from_spec(spec).unwrap_err();
             assert!(e.contains("pusta nazwa"), "spec {spec:?} dało: {e}");
         }
@@ -219,6 +306,10 @@ mod tests {
         let mut sel = Selection::default();
         sel.extend_from_spec("  speculative-stt  ").unwrap();
         assert_eq!(sel.names(), vec!["speculative-stt"]);
+        // spacja po przecinku w liście (tak wygląda tekst wklejony z notatek)
+        let mut sel = Selection::with_features(TEST_FEATURES);
+        sel.extend_from_spec(" aaa , bbb ").unwrap();
+        assert_eq!(sel.names(), vec!["aaa", "bbb"]);
     }
 
     #[test]

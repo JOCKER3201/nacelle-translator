@@ -109,6 +109,11 @@ fn cmd_run(config_path: &PathBuf, experimental: &experimental::Selection) -> Res
     // tor AI widzi zwykły Config i nie zna pojęcia flagi
     experimental.apply(&mut cfg);
     experimental.log_startup();
+    // strojenie sprawdzamy PO nałożeniu opcji — inaczej nie wiadomo, którego
+    // toru dotyczy wartość z pliku
+    if let Some(w) = cfg.tuning_warning() {
+        log::warn!("{w}");
+    }
 
     // ringbuffery RT ↔ tor AI
     let (cap_prod, cap_cons) = HeapRb::<f32>::new(pw::RATE as usize * 4).split(); // mono, 4 s
@@ -197,6 +202,11 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
         println!("  OK    opcje eksperymentalne: brak (włącza je {}=…)", experimental::FLAG);
     } else {
         println!("  OK    opcje eksperymentalne: {}", experimental.names().join(", "));
+    }
+    // UWAGA, nie BŁĄD: konfiguracja jest poprawna, tylko dostrojona pod drugi
+    // tor — nie ma powodu, żeby przez to zwracać kod wyjścia 1
+    if let Some(w) = cfg.tuning_warning() {
+        println!("  UWAGA {w}");
     }
 
     // model whisper

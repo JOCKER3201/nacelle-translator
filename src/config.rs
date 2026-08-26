@@ -303,6 +303,28 @@ impl Config {
     pub fn stt_model(&self) -> PathBuf {
         expand_tilde(&self.stt.model)
     }
+
+    /// Strojenie, które ma sens tylko na JEDNYM z torów — sprawdzane po
+    /// nałożeniu opcji eksperymentalnych, więc widzi tor faktycznie wybrany.
+    ///
+    /// Powód: `soft_max_ms` podniesiony pod spekulację (6000) na torze
+    /// wsadowym nie jest „luźniejszym cięciem", tylko WPROST opóźnieniem
+    /// pierwszych słów lektora — bez spekulacji nic nie wychodzi z segmentera
+    /// przed domknięciem segmentu. Ten sam plik konfiguracyjny obsługuje oba
+    /// tory, więc rozjazd trzeba nazwać głośno, zamiast liczyć na pamięć.
+    pub fn tuning_warning(&self) -> Option<String> {
+        const BEZ_SPEKULACJI_MAX_MS: u32 = 3_000;
+        if !self.stt.speculative && self.vad.soft_max_ms > BEZ_SPEKULACJI_MAX_MS {
+            return Some(format!(
+                "vad.soft_max_ms = {} bez spekulacyjnego STT: pierwsze słowa lektora czekają \
+                 do {:.1} s od początku frazy — zejdź na 2000-3000 albo uruchom z flagą \
+                 --experimental-futures=speculative-stt (pod nią wyższa wartość jest zyskiem)",
+                self.vad.soft_max_ms,
+                self.vad.soft_max_ms as f32 / 1000.0
+            ));
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -323,6 +345,22 @@ mod tests {
     fn zwykly_blad_skladni_zostaje_bledem_skladni() {
         let err = parse_str("[stt\n", Path::new("x.toml")).unwrap_err().to_string();
         assert!(err.contains("błąd składni"), "{err}");
+    }
+
+    #[test]
+    fn wysoki_soft_max_bez_spekulacji_daje_ostrzezenie() {
+        let mut cfg = Config::default();
+        cfg.vad.soft_max_ms = 6_000;
+        let w = cfg.tuning_warning().expect("6000 bez spekulacji to opóźnienie, nie strojenie");
+        assert!(w.contains("6.0 s"), "{w}");
+        assert!(w.contains("--experimental-futures=speculative-stt"), "{w}");
+        // ta sama wartość Z flagą jest zamierzona i musi milczeć
+        cfg.stt.speculative = true;
+        assert!(cfg.tuning_warning().is_none());
+        // wartość szablonowa nie hałasuje na żadnym torze
+        cfg.stt.speculative = false;
+        cfg.vad.soft_max_ms = 2_000;
+        assert!(cfg.tuning_warning().is_none());
     }
 
     #[test]

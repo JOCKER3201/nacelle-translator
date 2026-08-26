@@ -191,7 +191,9 @@ Powtórzenie flagi sumuje opcje; nieznana nazwa kończy program kodem 2 i
 wypisuje listę dostępnych opcji (ta sama lista jest w `--help`, a podkomenda
 `check` pokazuje, które opcje są aktywne dla podanych argumentów).
 
-Dostępne dziś:
+Pełna, zawsze aktualna lista opcji: `nacelle-translator --help` (generuje ją
+kod, więc nie ma jak się rozjechać). Poniżej rozszerzony opis — trafiają tu
+wyłącznie opcje, które wymagają dostrojenia kluczami w pliku konfiguracyjnym:
 
 - **`speculative-stt`** — spekulacyjne STT (LocalAgreement-2): whisper jest
   puszczany co `stt.cadence_ms` czasu audio na rosnącym, **otwartym**
@@ -204,9 +206,11 @@ Dostępne dziś:
   podnieść `vad.soft_max_ms` (patrz komentarz w
   `nacelle-translator.toml.example`).
 
-Uruchomienie z opcją eksperymentalną wypisuje na starcie linię `INFO`
-`OPCJA EKSPERYMENTALNA: …` — po to, by log z sesji dało się jednoznacznie
-przypisać do wariantu.
+Każde uruchomienie wypisuje na starcie linię `OPCJE EKSPERYMENTALNE: …`
+(z listą albo z `brak`) — po to, by log z sesji dało się jednoznacznie
+przypisać do wariantu, także wtedy, gdy wklejasz sam fragment. Wariant
+z opcjami leci na poziomie `WARN`, więc przeżywa `RUST_LOG=warn`; szczegółowy
+opis każdej włączonej opcji idzie osobną linią `INFO`.
 
 ## Wybór urządzenia wyjściowego
 
