@@ -337,7 +337,10 @@ pub struct LlamaCppTranslator {
 ///    alfanumeryczny (odsiewa "2.5Gb/s", "5GB/GBps"),
 ///  * wspólny prefiks >= 3 ZNAKÓW (nie bajtów!), bez rozróżniania wielkości
 ///    liter — odsiewa "Gb/s", "WAN/LAN", "km/h", "wejście/wyjście" (prefiks 1),
-///  * długości wariantów różnią się najwyżej o 2 znaki.
+///  * długości wariantów różnią się najwyżej o 2 znaki,
+///  * ŻADEN bieg nie jest prefiksem drugiego — odsiewa akronim i jego
+///    rozszerzenie ("HTTP/HTTPS", "USB/USBC", "PoE/PoE+"), które oba warunki
+///    wyżej przechodzą, a zwinięcie kosztowałoby połowę treści merytorycznej.
 ///
 /// Znany, ZAAKCEPTOWANY fałszywy alarm: "przed/przez" (wspólny prefiks
 /// "prze"). Przy jednym ukośniku na całą 7-minutową sesję to koszt pomijalny.
@@ -399,7 +402,8 @@ fn collapse_variant_slashes(s: &str) -> String {
 /// Wszystko liczone w ZNAKACH, nie bajtach — "żółty/żółta" ma 5 znaków,
 /// ale 7 bajtów, a cięcie po bajtach panikowałoby na granicy diakrytyku.
 fn same_variant(left: &str, right: &str) -> bool {
-    if left.chars().count().abs_diff(right.chars().count()) > 2 {
+    let (ln, rn) = (left.chars().count(), right.chars().count());
+    if ln.abs_diff(rn) > 2 {
         return false;
     }
     let common = left
@@ -408,7 +412,14 @@ fn same_variant(left: &str, right: &str) -> bool {
         .zip(right.chars().flat_map(char::to_lowercase))
         .take_while(|(a, b)| a == b)
         .count();
-    common >= 3
+    // Wariant fleksyjny różni się KOŃCÓWKĄ, więc żaden bieg nie jest prefiksem
+    // drugiego ("pewien"/"pewna" rozjeżdżają się na 4. znaku). Akronim i jego
+    // rozszerzenie są dokładnie odwrotne: "HTTP"/"HTTPS", "USB"/"USBC",
+    // "PoE"/"PoE+" mają wspólny prefiks równy krótszemu biegowi i sam warunek
+    // >= 3 znaków ich NIE odsiewa — a materiał, na którym ten sanitizer ma
+    // działać, to recenzja sprzętu sieciowego, gdzie taka para jest treścią
+    // merytoryczną, nie ozdobnikiem. Zwinięcie usunęłoby połowę informacji.
+    common >= 3 && common < ln.min(rn)
 }
 
 /// Angielska nazwa języka do promptu TranslateGemma ("en" → "English").
@@ -786,6 +797,12 @@ mod tests {
             "AdGuard/OpenWRT",
             "Wi-Fi 7 / MLO",
             "5GB/GBps",
+            // akronim + rozszerzenie: różnica długości <= 2 i wspólny prefiks
+            // >= 3 SPEŁNIONE, odsiewa je dopiero warunek "żaden bieg nie jest
+            // prefiksem drugiego". Bez niego "HTTP/HTTPS" czytało się "HTTP".
+            "HTTP/HTTPS",
+            "USB/USBC",
+            "PoE/PoE+",
         ] {
             assert_eq!(collapse_variant_slashes(s), s, "zmieniono: {s}");
         }

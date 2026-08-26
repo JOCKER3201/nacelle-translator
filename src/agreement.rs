@@ -262,13 +262,42 @@ impl SpeculativeTracker {
     /// z d=1 i emisja przeskoczyłaby całe zdanie (zweryfikowany ubytek 8 słów,
     /// pilnuje tego T20).
     ///
-    /// Bilans najgorszego przypadku: ubytek względem obecnego kodu jest
-    /// ograniczony zakresem okna do 2*ANCHOR_K + 1 = 7 słów i wymaga, żeby
-    /// IDENTYCZNY 4-gram powtórzył się w promieniu 3 słów od kotwicy — w całej
-    /// analizowanej sesji taki układ nie wystąpił ani razu.
+    /// PRZEBIEG IDEALNY WYŁĄCZNIE DLA PEŁNEJ KOTWICY (m == ANCHOR_M). Kotwica
+    /// jest krótsza po każdym PIERWSZYM fragmencie segmentu liczącym mniej niż
+    /// 4 słowa, a bramka fragmentu wprost takie dopuszcza (2 słowa o >=
+    /// min_fragment_chars znakach przechodzą) — w sesji audytu 12 z 63
+    /// segmentów otwierało się fragmentem 2- lub 3-słowowym. Przy m < ANCHOR_M
+    /// przebieg idealny NIC NIE KUPUJE, bo `find_anchor` ma tam tol = 1, a
+    /// naprawiane fałszywe okno przesunięte o jedno słowo ma d = 2 i przez tę
+    /// tolerancję i tak nie przechodzi. Wnosi za to ubytek: warunkiem przeskoku
+    /// przestaje być powtórzony 4-gram, a staje się powtórzony BI-GRAM
+    /// ("absolutely fantastic, absolutely fantastic"), co w mowie potocznej jest
+    /// codziennością. Zweryfikowany kontrprzykład dla m = 2: pętla rozmyta
+    /// zwraca 2 (duplikat, bezpiecznie), przebieg idealny bez tej bramki
+    /// zwracał 4 i dwa słowa NIGDY nie trafiały do lektora — pilnuje tego T22.
+    ///
+    /// Bilans najgorszego przypadku PO tej bramce: ubytek względem pętli
+    /// rozmytej jest ograniczony zakresem okna do 2*ANCHOR_K + 1 = 7 słów
+    /// i wymaga, żeby IDENTYCZNY 4-gram powtórzył się 1-3 słowa ZA kotwicą
+    /// (wcześniejsze powtórzenie jest bezpieczne — skan idzie od w_lo i zwraca
+    /// najwcześniejsze trafienie, czyli duplikat) przy jednoczesnej rewizji
+    /// prawdziwego wystąpienia. W analizowanej sesji taki układ nie wystąpił
+    /// ani razu, a od teraz jest WIDOCZNY: resync o więcej niż jedno słowo
+    /// podnosi WARN w on_partial (oba udokumentowane defekty to skok o
+    /// dokładnie 1, bo whisper dokłada/zabiera JEDNO słowo przed granicą).
+    /// Rozważone i odrzucone: zawężenie przebiegu idealnego do +/-1. Zdjęłoby
+    /// resztkowe ryzyko, ale kosztem dopasowań przy dryfie licznika o 2-3 słowa,
+    /// które w tym materiale realnie występują (front hipotezy #22 przesunął się
+    /// o 3 słowa) — a tam brak trafienia oznacza powrót duplikatu.
+    ///
+    /// Skala zysku, skorygowana pomiarem po fakcie: ~26 słów to ~5-6 s czasu
+    /// lektora (nie ~8 s — jedna z 10 par, #6 "quieter", NIE jest artefaktem,
+    /// mówca faktycznie powtórzył słowo trzy razy). Duplikaty nie rozkładają się
+    /// równomiernie: sam segment #69 wnosi ~2,4 s w ostatnich 20 s materiału,
+    /// więc GŁÓWNYM efektem jest skrócenie OGONA, a nie średniego obciążenia.
     fn find_anchor_windowed(&self, words: &[Word], w_lo: usize, w_hi: usize) -> Option<usize> {
         let m = self.committed_tail.len();
-        if m > 0 {
+        if m >= ANCHOR_M {
             for w in w_lo..w_hi.min(words.len()) {
                 // okno MUSI mieścić się w całości: obcięte na końcu listy nie
                 // jest "dopasowaniem idealnym" (final krótszy niż committed —
@@ -361,6 +390,23 @@ impl SpeculativeTracker {
                     );
                     if c > self.committed {
                         self.resyncs_up += 1;
+                        // Jedyna obserwowalna sygnatura resztkowego ryzyka
+                        // ubytku z find_anchor_windowed: uzasadniony resync
+                        // w przód to ZAWSZE skok o 1 (whisper dokłada jedno
+                        // słowo przed granicą commitu — #43, #69). Skok o 2-3
+                        // znaczy, że przebieg idealny trafił w POWTÓRZONĄ frazę
+                        // za kotwicą, a wtedy przeskoczone słowa nigdy nie
+                        // pójdą do lektora. WARN, nie DEBUG: w całym logu
+                        // audytu nie było ani jednej linii DEBUG.
+                        if c > self.committed + 1 {
+                            log::warn!(
+                                "spekulacja: gen {gen} resync W PRZÓD o {} słów ({} → {c}) — \
+                                 sprawdź powtórzoną frazę przed granicą commitu \
+                                 (ryzyko pominięcia słów)",
+                                c - self.committed,
+                                self.committed
+                            );
+                        }
                     } else {
                         self.resyncs_down += 1;
                     }
@@ -992,5 +1038,34 @@ mod tests {
         assert!(emit.had_commits);
         assert_eq!(emit.text, "echo fox.");
         assert_eq!(tr.reanchors, 0);
+    }
+
+    // T22: REGRESJA PRZECIW PRZEBIEGOWI IDEALNEMU NA KRÓTKIEJ KOTWICY.
+    // Segment otwarty fragmentem 2-słowowym (bramka przepuszcza go po liczbie
+    // znaków) zostawia kotwicę m=2, a wtedy warunkiem przeskoku przestaje być
+    // powtórzony 4-gram i staje się powtórzony BI-GRAM. Tu mówca powtarza
+    // "absolutely fantastic", a whisper rewiduje PIERWSZE wystąpienie
+    // ("Absolutely" → "Absolute"). Bez bramki m >= ANCHOR_M przebieg idealny
+    // dopasowywał kotwicę do DRUGIEGO wystąpienia i ogon finalu zaczynał się od
+    // "work here." — dwa słowa, których lektor nigdy nie powiedział, znikały
+    // bezpowrotnie. Poprawny wynik to duplikat: pętla rozmyta (tol=1 przy m<4)
+    // trafia w prawdziwe, zrewidowane miejsce z d=1. Duplikat jest CENĄ,
+    // nie błędem — zasada nadrzędna pliku.
+    #[test]
+    fn t22_krotka_kotwica_powtorzona_fraza_bez_ubytku() {
+        let mut tr = tracker();
+        assert!(tr
+            .on_partial(1, "Absolutely fantastic, absolutely")
+            .is_none());
+        let frag = tr
+            .on_partial(1, "Absolutely fantastic, absolutely fantastic")
+            .expect("fragment 2-słowowy przechodzi bramkę po liczbie znaków");
+        assert_eq!(frag.text, "Absolutely fantastic,");
+        assert_eq!(frag.new_committed, 2);
+        tr.commit(&frag); // kotwica = [absolutely, fantastic], m = 2
+
+        let emit = tr.on_final(1, 1, 1, "Absolute fantastic, absolutely fantastic work here.");
+        assert!(!emit.reanchored);
+        assert_eq!(emit.text, "absolutely fantastic work here.");
     }
 }

@@ -1026,9 +1026,19 @@ fn tts_thread(
         // 3,7 → 7,4 s. Odczyt indeksów atomowych ringu: bez blokowania, bez
         // alokacji. Pomiar MUSI być przed pętlą push_slice niżej — po niej ring
         // jest zawsze pełny i liczba traci sens.
-        // WYŁĄCZNIE DIAGNOSTYKA — ani `ring_s`, ani `kolejka` NIE wchodzą do
-        // żadnej decyzji o tempie ani o porzucaniu (progi są dziś strojone na
-        // szum i najpierw potrzebują danych, a nie kolejnej regulacji).
+        // CZYTAJĄC LOG: `ring` jest z definicji ograniczony pojemnością ringu
+        // (3 s, main.rs), a pomiar wypada tuż po zakończeniu BLOKUJĄCEJ pętli
+        // push_slice poprzedniego klipu, więc przy nasyconym torze będzie
+        // wisiał tuż pod 3.0 s. Wartość informacyjną ma dopiero wtedy, gdy
+        // WYRAŹNIE spada poniżej — to znaczy, że kolejka odtwarzania faktycznie
+        // się opróżniła. Reszta zaległości siedzi w `wiek`, bo cały tor to
+        // łańcuch kanałów bounded(1) z blokującym send: zaległość nie stoi
+        // w kolejce, tylko w zablokowanych wątkach, i wychodzi na jaw jako
+        // wiek zadania. NIE logujemy `tts_rx.len()` — kanał ma pojemność 1,
+        // więc byłby to jeden bit udający głębokość kolejki.
+        // WYŁĄCZNIE DIAGNOSTYKA — `ring_s` NIE wchodzi do żadnej decyzji
+        // o tempie ani o porzucaniu (progi są dziś strojone na szum i najpierw
+        // potrzebują danych, a nie kolejnej regulacji).
         let ring_s = tts_prod.occupied_len() as f32 / crate::pw::RATE as f32;
         let age_now = job.created.elapsed();
         // wiek = pełne opóźnienie toru od zamknięcia segmentu do gotowej
@@ -1038,11 +1048,10 @@ fn tts_thread(
         // skrypty czytające „wiek {x}s" dalej działały.
         log::info!(
             "#{label} 🔊 {:.1}s mowy lektora (tts {} ms, wiek {:.1}s, ring {ring_s:.1}s, \
-             kolejka {}, zaległość odsłuchu {:.1}s{})",
+             zaległość odsłuchu {:.1}s{})",
             clip48.len() as f32 / crate::pw::RATE as f32,
             t0.elapsed().as_millis(),
             age_now.as_secs_f32(),
-            tts_rx.len(),
             age_now.as_secs_f32() + ring_s,
             match tempo {
                 Tempo::Nominalne => "",

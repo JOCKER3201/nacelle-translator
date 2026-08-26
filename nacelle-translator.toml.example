@@ -102,7 +102,12 @@ length_scale = 0.60             # <1.0 = szybsza mowa. 0.68 -> 0.60 na podstawie
                                  # obciążenie kanału lektora wynosiło 97.1 % i tryb
                                  # doganiania był WARUNKIEM DZIAŁANIA, a nie rezerwą.
                                  # Przy 0.60 obciążenie spada do ~95 %, a stan ustalony
-                                 # opóźnienia z ~6.6 s do ~3-4 s. Za szybko? 0.63 daje ~95-96 %.
+                                 # opóźnienia z ~6.6 s do ~3-4 s.
+                                 # 0.63 NIE jest wariantem awaryjnym: z tego samego modelu
+                                 # wychodzi ~99 % obciążenia, czyli powrót do nasycenia
+                                 # (0.68 -> 106 %, 0.63 -> 99 %, 0.60 -> 95 %, 0.55 -> 89 %).
+                                 # Jeśli 0.60 brzmi za szybko, skracaj tekst wyjściowy,
+                                 # a nie podnoś length_scale.
                                  # ZASTRZEŻENIE: 18.92 / 21.80 zn/s zmierzono dla głosu
                                  # pl_PL-*-medium i pary EN->PL. To NIE jest uniwersalna
                                  # stała — dla innego głosu i innej pary językowej ekspansję
