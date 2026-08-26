@@ -6,6 +6,23 @@
 # — nigdy w tym pliku.
 
 [audio]
+# Czy dźwięk przechodzący przez węzeł ma być MIELONY PRZEZ AI
+# (VAD → whisper → tłumaczenie → lektor).
+#
+# To NIE jest wyłącznik węzła: przelotka i passthrough działają ZAWSZE,
+# niezależnie od tej wartości. Dźwięk przechodzi przez translator do
+# urządzenia tak samo w obu trybach; ten klucz decyduje wyłącznie o tym, czy
+# po drodze jest dodatkowo analizowany.
+#
+# Domyślnie `false`, bo węzeł stoi w torze CAŁEGO dźwięku systemu. Przy
+# `true` do VAD trafia wszystko — gra, powiadomienie, muzyka — whisper
+# miele to na GPU, lektor odzywa się w środku rozgrywki, a ducking ścisza
+# CAŁY system o ~14 dB przy każdej jego wypowiedzi, także wtedy gdy tłumaczy
+# zupełnie inną aplikację. Włącz świadomie.
+#
+# Przy `false` tor AI nie dostaje ani jednej próbki, więc GPU stoi.
+translate = false
+
 # node.name sprzętowego urządzenia wyjściowego (lista: nacelle-translator devices).
 # Zakomentowane = auto-wykrycie: najpierw aktualne skonfigurowane domyślne
 # wyjście z PipeWire, a gdy to już MY (bo program działa i jest ustawiony

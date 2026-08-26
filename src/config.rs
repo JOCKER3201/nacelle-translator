@@ -18,6 +18,17 @@ pub struct AudioCfg {
     /// node.name sprzętowego sinka; nieobecny/zakomentowany lub pusty =
     /// automatyczny wybór pierwszego urządzenia ALSA/Bluetooth
     pub output_device: Option<String>,
+    /// Czy dźwięk w ogóle wchodzi do toru AI (VAD → whisper → tłumaczenie →
+    /// lektor). NIE dotyczy passthrough: dźwięk przechodzi przez węzeł
+    /// zawsze, niezależnie od tej wartości.
+    ///
+    /// DOMYŚLNIE `false`, i to jest decyzja, nie przeoczenie. Węzeł jest
+    /// przelotką w torze CAŁEGO systemu, więc `true` znaczy: każdy dźwięk
+    /// (gra, powiadomienie, muzyka) leci do VAD, whisper miele go na GPU,
+    /// lektor odzywa się w losowym momencie, a ducking ścisza CAŁY system
+    /// o ~14 dB przy każdej jego wypowiedzi. To musi być świadomy wybór
+    /// użytkownika, a nie zachowanie pierwszego uruchomienia po `git clone`.
+    pub translate: bool,
     pub passthrough_gain: f32,
     /// głośność oryginału, gdy mówi lektor (0.2 ≈ -14 dB)
     pub duck_gain: f32,
@@ -31,6 +42,7 @@ impl Default for AudioCfg {
     fn default() -> Self {
         Self {
             output_device: None,
+            translate: false,
             passthrough_gain: 1.0,
             duck_gain: 0.2,
             tts_gain: 1.0,
@@ -373,6 +385,21 @@ mod tests {
         cfg.stt.speculative = false;
         cfg.vad.soft_max_ms = 2_000;
         assert!(cfg.tuning_warning().is_none());
+    }
+
+    #[test]
+    fn tlumaczenie_domyslnie_wylaczone_i_wlaczane_z_pliku() {
+        // brak klucza = przelotka bez AI (patrz doc-komentarz pola)
+        assert!(!parse_str("", Path::new("x.toml")).unwrap().audio.translate);
+        assert!(!Config::default().audio.translate);
+        // i włącza je WYŁĄCZNIE jawny wpis użytkownika
+        let cfg = parse_str("[audio]\ntranslate = true\n", Path::new("x.toml")).unwrap();
+        assert!(cfg.audio.translate);
+        // sąsiednie klucze sekcji dalej działają normalnie
+        let cfg = parse_str("[audio]\ntranslate = true\nduck_gain = 0.5\n", Path::new("x.toml"))
+            .unwrap();
+        assert!(cfg.audio.translate);
+        assert_eq!(cfg.audio.duck_gain, 0.5);
     }
 
     #[test]

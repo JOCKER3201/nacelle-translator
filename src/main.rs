@@ -142,6 +142,7 @@ fn cmd_run(config_path: &PathBuf, experimental: &experimental::Selection) -> Res
             tts_cons,
         },
         pw::DuckParams::from_cfg(&cfg.audio),
+        pw::TranslateGate::new(cfg.audio.translate),
         health_rx,
     )
 }
@@ -207,6 +208,19 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
     // tor — nie ma powodu, żeby przez to zwracać kod wyjścia 1
     if let Some(w) = cfg.tuning_warning() {
         println!("  UWAGA {w}");
+    }
+
+    // Bramka toru AI — wypisana WYSOKO, bo bez niej `check` potrafi
+    // wyświetlić same OK komuś, kto potem nie usłyszy ani słowa lektora
+    // (model, piper i klucz API są sprawne; po prostu nic ich nie woła).
+    // To nie jest BŁĄD: przelotka bez tłumaczenia jest poprawnym trybem.
+    if cfg.audio.translate {
+        println!("  OK    tłumaczenie WŁĄCZONE ([audio].translate = true)");
+    } else {
+        println!(
+            "  OK    tłumaczenie WYŁĄCZONE (domyślnie) — węzeł jest czystą przelotką, tor AI \
+             nie dostaje próbek.\n        Włącz wpisem `translate = true` w sekcji [audio]."
+        );
     }
 
     // model whisper

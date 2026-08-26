@@ -197,6 +197,62 @@ pub struct RtRings {
     pub tts_cons: HeapCons<f32>,
 }
 
+/// Bramka toru AI — JEDYNE miejsce, które decyduje, czy dźwięk przechodzący
+/// przez węzeł jest w ogóle mielony przez AI.
+///
+/// Po co osobny typ zamiast gołego `bool`: bramka steruje DWOMA callbackami
+/// RT w różnych strumieniach (karmienie `cap_prod` w sinku, odtwarzanie
+/// lektora w playbacku) i te dwie decyzje MUSZĄ być zgodne. Rozjazd nie
+/// wywala programu, tylko daje ciche patologie: bramka „karm AI, nie graj
+/// lektora" pali GPU bez efektu, a odwrotna („graj lektora, nie karm AI")
+/// zostawia w ringu resztkę mowy z poprzedniej sesji i ściszy oryginał pod
+/// zdanie, które nie ma już do czego pasować. Jeden typ z dwoma metodami
+/// czytającymi to samo pole zamyka tę klasę błędów, a test `b3` pilnuje
+/// niezmiennika.
+///
+/// KOSZT W RT: pole jest kopiowane do stanu callbacku PRZY STARCIE i dalej
+/// czytane jako zwykły `bool` — bez atomiku, bez blokady, bez alokacji.
+/// Wartość zapada raz, przy wczytaniu konfiguracji; nie ma przełącznika
+/// w locie, więc atomik byłby tylko droższym zapisem tego samego faktu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TranslateGate {
+    on: bool,
+}
+
+impl TranslateGate {
+    pub fn new(on: bool) -> Self {
+        Self { on }
+    }
+
+    /// [RT] czy wpychać mono do `cap_prod` (wejście segmentera/VAD).
+    /// `false` = tor AI nie dostaje ani jednej próbki, więc whisper nigdy
+    /// nie rusza i GPU stoi.
+    #[inline]
+    pub fn feeds_ai(self) -> bool {
+        self.on
+    }
+
+    /// [RT] czy w ogóle drenować ring TTS i mieszać lektora (a więc i
+    /// duckować oryginał).
+    #[inline]
+    pub fn plays_tts(self) -> bool {
+        self.on
+    }
+
+    /// Jedna linia do logu startowego — żeby po fakcie dało się z logu sesji
+    /// odczytać, w którym trybie program chodził.
+    pub fn describe(self) -> &'static str {
+        if self.on {
+            "tłumaczenie WŁĄCZONE: dźwięk przechodzący przez węzeł idzie do VAD/whisper \
+             i może zostać przeczytany przez lektora (oryginał jest wtedy przyciszany)"
+        } else {
+            "tłumaczenie WYŁĄCZONE ([audio].translate = false): węzeł jest czystą przelotką, \
+             tor AI nie dostaje ani jednej próbki, GPU stoi — włącz kluczem \
+             [audio].translate = true w nacelle-translator.toml"
+        }
+    }
+}
+
 /// Parametry duckingu przeliczone na współczynniki per próbka @48 kHz.
 #[derive(Clone, Copy)]
 pub struct DuckParams {
@@ -606,6 +662,8 @@ struct SinkState {
     mono: Vec<f32>,
     cap_dropped: Arc<AtomicU64>,
     pass_dropped: Arc<AtomicU64>,
+    /// kopia bramki — czytana w callbacku RT jako zwykły `bool`
+    gate: TranslateGate,
 }
 
 struct PlayState {
@@ -618,6 +676,8 @@ struct PlayState {
     hold: u32,
     /// tylko pomiar (Etap 1a) — nie wpływa na ani jedną próbkę
     stats: Arc<PassStats>,
+    /// kopia bramki — czytana w callbacku RT jako zwykły `bool`
+    gate: TranslateGate,
 }
 
 /// Współdzielony stan fatalny: ustawiany z callbacków `state_changed`/`error`
@@ -765,9 +825,13 @@ pub fn run_graph(
     output_device: Option<&str>,
     rings: RtRings,
     duck: DuckParams,
+    gate: TranslateGate,
     health_rx: crossbeam_channel::Receiver<String>,
 ) -> Result<()> {
     pw::init();
+    // Jedna linia, żeby z logu sesji dało się odczytać tryb pracy bez
+    // zgadywania „czy on w ogóle tłumaczył".
+    log::info!("{}", gate.describe());
 
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
@@ -821,6 +885,7 @@ pub fn run_graph(
         mono: vec![0.0; SCRATCH_FRAMES],
         cap_dropped: cap_dropped.clone(),
         pass_dropped: pass_dropped.clone(),
+        gate,
     };
 
     let _sink_listener = sink_stream
@@ -881,15 +946,20 @@ pub fn run_graph(
                     st.pass_dropped
                         .fetch_add((nsamples - pushed) as u64, Ordering::Relaxed);
                 }
-                // downmix mono dla toru AI; pełny ring => nadmiar przepada
-                let frames = nsamples / CHANNELS;
-                for f in 0..frames {
-                    st.mono[f] = (st.stereo[f * 2] + st.stereo[f * 2 + 1]) * 0.5;
-                }
-                let pushed = st.cap_prod.push_slice(&st.mono[..frames]);
-                if pushed < frames {
-                    st.cap_dropped
-                        .fetch_add((frames - pushed) as u64, Ordering::Relaxed);
+                // downmix mono dla toru AI; pełny ring => nadmiar przepada.
+                // Przy zamkniętej bramce pomijamy CAŁOŚĆ (także sam downmix):
+                // przelotka ma wtedy kosztować tyle co przepisanie próbek,
+                // a nie tyle co przepisanie plus pętla mnożeń na darmo.
+                if st.gate.feeds_ai() {
+                    let frames = nsamples / CHANNELS;
+                    for f in 0..frames {
+                        st.mono[f] = (st.stereo[f * 2] + st.stereo[f * 2 + 1]) * 0.5;
+                    }
+                    let pushed = st.cap_prod.push_slice(&st.mono[..frames]);
+                    if pushed < frames {
+                        st.cap_dropped
+                            .fetch_add((frames - pushed) as u64, Ordering::Relaxed);
+                    }
                 }
                 pos += nbytes;
             }
@@ -937,6 +1007,7 @@ pub fn run_graph(
         gain: duck.pass_gain,
         hold: 0,
         stats: pass_stats.clone(),
+        gate,
     };
 
     let _play_listener = play_stream
@@ -977,7 +1048,16 @@ pub fn run_graph(
                     let n = (frames - fi).min(SCRATCH_FRAMES);
                     let got_pass = st.pass_cons.pop_slice(&mut st.pass_scratch[..n * CHANNELS]);
                     let got_pass_frames = got_pass / CHANNELS;
-                    let got_tts = st.tts_cons.pop_slice(&mut st.tts_scratch[..n]);
+                    // Zamknięta bramka: ring TTS ZOSTAJE NIETKNIĘTY. Nie
+                    // drenujemy go „na wszelki wypadek" — przy zamkniętej
+                    // bramce tor AI nie dostaje próbek, więc nikt do tego
+                    // ringu nie pisze, a `got_tts = 0` gwarantuje dodatkowo,
+                    // że ducking ani razu się nie odpali.
+                    let got_tts = if st.gate.plays_tts() {
+                        st.tts_cons.pop_slice(&mut st.tts_scratch[..n])
+                    } else {
+                        0
+                    };
 
                     for j in 0..n {
                         let has_tts = j < got_tts;
@@ -1275,6 +1355,51 @@ mod tests {
         s.observe(100, 0);
         // nowe okno nie może odziedziczyć kwantu po poprzednim
         assert_eq!(s.take().unwrap().quantum_frames, 0);
+    }
+
+    #[test]
+    fn b1_bramka_zamknieta_odcina_oba_tory() {
+        let g = TranslateGate::new(false);
+        assert!(!g.feeds_ai(), "zamknięta bramka nie może karmić toru AI");
+        assert!(!g.plays_tts(), "zamknięta bramka nie może grać lektora");
+    }
+
+    #[test]
+    fn b2_bramka_otwarta_przepuszcza_oba_tory() {
+        let g = TranslateGate::new(true);
+        assert!(g.feeds_ai());
+        assert!(g.plays_tts());
+    }
+
+    #[test]
+    fn b3_obie_decyzje_zawsze_zgodne() {
+        // NIEZMIENNIK: nigdy „karm AI, nie graj lektora" (praca GPU bez
+        // efektu) ani „graj lektora, nie karm AI" (ducking pod resztkę mowy
+        // z ringu, bez powiązanego oryginału). Rozjazd nie wywala programu,
+        // więc bez tego testu byłby cichy.
+        for on in [false, true] {
+            let g = TranslateGate::new(on);
+            assert_eq!(g.feeds_ai(), g.plays_tts(), "rozjazd bramki dla on={on}");
+        }
+    }
+
+    #[test]
+    fn b4_domyslnie_bramka_jest_zamknieta() {
+        // Repozytorium jest publiczne: `git clone` + `cargo run` nie może
+        // zacząć mielić całego dźwięku systemu na GPU.
+        let cfg = crate::config::Config::default();
+        assert!(!cfg.audio.translate);
+        assert!(!TranslateGate::new(cfg.audio.translate).feeds_ai());
+    }
+
+    #[test]
+    fn b5_opis_trybu_nazywa_klucz_konfiguracji() {
+        // Log startowy ma dać się przeczytać BEZ zaglądania do kodu: przy
+        // wyłączonym tłumaczeniu musi paść nazwa klucza, którym się je włącza.
+        let off = TranslateGate::new(false).describe();
+        assert!(off.contains("translate"), "{off}");
+        assert!(off.contains("WYŁĄCZONE"), "{off}");
+        assert!(TranslateGate::new(true).describe().contains("WŁĄCZONE"));
     }
 
     #[test]
