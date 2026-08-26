@@ -49,6 +49,21 @@
 //!    węzła przy każdym rescanie.
 //!  - własnego wyboru urządzenia (dawne `pick_output`): wybiera
 //!    WirePlumber, my nie mamy w tym głosu ani potrzeby.
+//!  - `node.passive` na strumieniu PRZY WŁĄCZONYM TŁUMACZENIU: przy
+//!    otwartej bramce nie jesteśmy wyłącznie filtrem, tylko także źródłem
+//!    dźwięku (lektor), a pasywny węzeł nie budzi uśpionego wyjścia.
+//!    Szczegóły przy `play_props`.
+//!
+//! CZEGO WIREPLUMBEROWI ZABRANIAMY WPROST:
+//!  - `state.restore-target = false` na OBU węzłach: bez tego
+//!    node/state-stream.lua przywraca zapamiętany cel przez
+//!    `metadata:set(..., "target.object", ...)`, a find-defined-target.lua
+//!    robi z tego `has_defined_target = true` — czyli przypięcie do jednego
+//!    sprzętu wraca tylnymi drzwiami i przeżywa restart.
+//!  - `state.restore-props = false` na OBU węzłach: zapamiętane wyciszenie
+//!    któregokolwiek z nich ścisza CAŁY system przy każdym starcie, w
+//!    miejscu, którego użytkownik nie widzi w aplecie. Tak samo robi wzorzec
+//!    valve-galileo (wireplumber.conf.d/stream.conf, dla obu węzłów pary).
 //!
 //! Ochrona przed pętlą sprzężenia — co zostało i co faktycznie działa:
 //!  1. `node.link-group` o tej samej wartości na obu węzłach. To jedyny
@@ -1084,6 +1099,10 @@ pub fn run_graph(
             // stanu ściszyłaby cichcem cały system, w miejscu, którego
             // użytkownik nie widzi nawet w aplecie.
             "state.restore-props" => "false",
+            // Symetrycznie do STREAM-u (patrz niżej): hook `node/restore-stream`
+            // łapie też `Audio/*` bez `device.routes`, czyli nas, i przy
+            // zapamiętanym celu wstawiłby nam `target.object` do metadanych.
+            "state.restore-target" => "false",
             "audio.position" => "[ FL FR ]",
         },
     )?;
@@ -1186,22 +1205,65 @@ pub fn run_graph(
     )?;
 
     // ---------- 2) odtwarzanie (Direction::Output) — cel wybiera WirePlumber ----------
-    let play_props = properties! {
+    let mut play_props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Playback",
         *pw::keys::NODE_NAME => OUT_NODE_NAME,
         "node.link-group" => LINK_GROUP,
-        // Pozwól sprzętowi zasnąć, gdy przez przelotkę nic nie leci.
-        // Bez tego nasz strumień jest zwykłym, aktywnym klientem
-        // odtwarzania i trzyma kartę/słuchawki wybudzone 24/7 — a przelotka
-        // z definicji stoi w torze cały czas, więc „24/7" jest tu dosłowne.
-        "node.passive" => "true",
+        // NIE POZWÓL WirePlumBEROWI PRZYWRÓCIĆ NAM CELU. Bez tego klucza
+        // node/state-stream.lua (hook `node/restore-stream`, interest
+        // `media.class matches "Stream/*"` — czyli MY) przy każdym starcie
+        // czyta zapamiętany cel i robi `metadata:set(bound-id,
+        // "target.object", ...)`. Ten wpis czyta potem
+        // find-defined-target.lua i ustawia `has_defined_target = true`,
+        // czyli DOKŁADNIE to przypięcie do jednego sprzętu, które ten model
+        // usuwa — tylko tylnymi drzwiami i trwale, bez śladu w naszym logu.
+        // Wystarczy, że użytkownik RAZ przeciągnie „nacelle-translator-out"
+        // na urządzenie w pavucontrol (nasz STREAM nie ma `node.virtual`,
+        // więc jest tam widoczny). Gałąź pomijająca (`target_in_props`)
+        // sprawdza WŁAŚCIWOŚCI węzła, a my ich celowo nie ustawiamy, więc
+        // nas nie chroni. Klucz blokuje obie strony: zapis
+        // (state-stream.lua:228) i odtworzenie (state-stream.lua:89).
+        "state.restore-target" => "false",
+        // Ta sama furtka na głośność/wyciszenie, zamknięta już na MAIN.
+        // W ~/.local/state/wireplumber/stream-properties na tej maszynie JUŻ
+        // istnieje wpis `Output/Audio:media.name:nacelle-translator-out` —
+        // jedno wyciszenie tego strumienia w mikserze i `node:set_param
+        // ("Props")` przywracałoby mute przy każdym starcie, dając niemą
+        // przelotkę bez ani jednego komunikatu. Wzorzec valve-galileo
+        // (wireplumber.conf.d/stream.conf) ustawia ten klucz dla OBU węzłów
+        // pary, nie tylko dla sinka — komentarz w źródle mówi wprost
+        // „in case the user has somehow managed to mute them".
+        "state.restore-props" => "false",
         // CELOWO BRAK `target.object` i `node.dont-fallback` — patrz nagłówek
         // pliku, sekcja „CZEGO TU CELOWO NIE MA". Pierwsze przypięłoby nas
         // do jednego sprzętu, drugie kazałoby WirePlumberowi niszczyć nasz
         // węzeł przy każdym rescanie (find-filter-target.lua, gałąź
         // `is_smart_filter and dont_fallback`).
     };
+    // `node.passive` TYLKO przy zamkniętej bramce — i to nie jest oszczędzanie
+    // na siłę, tylko warunek poprawności.
+    //
+    // Pasywny węzeł nie trzyma sinka zajętym: „if the node is not otherwise
+    // linked (via a non-passive link), the node and the sink it is linked to
+    // are idle (and eventually suspended)" (man 7 pipewire-props). Dla czystej
+    // przelotki jest to w 100% poprawne — nie mamy nic własnego do zagrania,
+    // więc gdy źródło milczy, sprzęt ma prawo zasnąć razem z nami. Wzorzec
+    // valve-galileo ustawia `node.passive` właśnie na filtrze bez własnego
+    // źródła dźwięku.
+    //
+    // Przy WŁĄCZONYM tłumaczeniu nie jesteśmy jednak wyłącznie filtrem: jesteśmy
+    // też NIEZALEŻNYM ŹRÓDŁEM (lektor). Scenariusz: film kończy się zdaniem,
+    // VAD zamyka segment, whisper + tłumaczenie + piper mielą kilka sekund,
+    // a w tym czasie źródło przestaje grać i pasywna grupa idzie w idle. Wtedy
+    // callback odtwarzania przestaje być wołany i zsyntetyzowane zdanie NIE MA
+    // CZYM się odegrać: albo zostaje w ringu i odzywa się przy zupełnie innym
+    // materiale, albo `tts_thread` blokuje się na pełnym ringu i po 10 s
+    // porzuca ogon wypowiedzi (`stall_decision`). Węzeł, który sam produkuje
+    // dźwięk, musi umieć obudzić wyjście — czyli nie może być pasywny.
+    if !gate.feeds_ai() {
+        play_props.insert("node.passive", "true");
+    }
     let play_stream = StreamBox::new(&core, OUT_NODE_NAME, play_props)?;
 
     let play_state = PlayState {
@@ -1410,9 +1472,11 @@ pub fn run_graph(
                     // a my mamy `Stream/Output/Audio`. Zerowa liczba cykli
                     // znaczy zawieszony węzeł albo stojący serwer.
                     //
-                    // Od modelu przelotki `node.passive=true` DOPUSZCZA, żeby
-                    // ta linia pojawiała się w normalnej pracy: gdy nikt nic
-                    // nie gra, sprzęt zasypia razem z nami i o to chodzi.
+                    // Przy ZAMKNIĘTEJ bramce `node.passive=true` DOPUSZCZA,
+                    // żeby ta linia pojawiała się w normalnej pracy: gdy nikt
+                    // nic nie gra, sprzęt zasypia razem z nami i o to chodzi.
+                    // Przy otwartej bramce nie jesteśmy pasywni (patrz
+                    // `play_props`), więc tam ta linia to już realny sygnał.
                     None => log::debug!(
                         "passthrough: ani jednego cyklu odtwarzania w ostatnich {}s \
                          — węzeł zawieszony albo serwer stanął",
