@@ -61,4 +61,4 @@ fi
 
 echo
 echo "gotowe: dist/ (binarka + ${#CUDA_LIB_NAMES[@]} biblioteki CUDA runtime)"
-echo "następny krok: sudo make install"
+echo "następny krok: make install (bez sudo — reguła sama woła sudo do kopiowania)"

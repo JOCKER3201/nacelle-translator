@@ -44,15 +44,15 @@ aplikacje ──▶ [Nacelle Translator (PL)]  (wirtualny sink, media.class=Audi
   Claude** (`engine = "claude"`, Messages API, klucz w `ANTHROPIC_API_KEY`)
   albo `"off"` do testu samego toru audio.
 - **TTS:** [piper] jako jeden długożyjący proces (`--json-input`, WAV na
-  tmpfs) z głosem `pl_PL-gosia-medium`, który masz już w
-  `~/.local/share/piper`.
+  tmpfs) z głosem `pl_PL-gosia-medium` (ścieżki w `[tts] piper_bin`
+  i `[tts] voice`; skąd wziąć — patrz „Wymagania").
 - **VAD:** Silero V5 (`voice_activity_detector`) — VAD energetyczny odpada,
   bo muzyka pod mową trzyma bramkę otwartą.
 - Wypowiedzi już po polsku są rozpoznawane i **pomijane** (przechodzi sam
   oryginał, bez duckingu).
 
 Opóźnienie z natury rzeczy: lektor odzywa się kilka sekund po oryginale
-(segmentacja per wypowiedź + STT na CPU + tłumaczenie + synteza; przy
+(segmentacja per wypowiedź + STT na GPU + tłumaczenie + synteza; przy
 lokalnym modelu Ollamy pierwsza wypowiedź po dłuższej ciszy płaci dodatkowo
 czas ładowania modelu do pamięci — `nacelle-translator` rozgrzewa go na starcie,
 żeby zminimalizować ten koszt w trakcie sesji). Oryginał gra na bieżąco,
@@ -60,13 +60,23 @@ więc obraz się nie rozjeżdża — spóźnia się tylko głos lektora.
 
 ## Wymagania
 
-Wszystko poza modelem whispera już jest na tym systemie:
+- **PipeWire** (daemon) + nagłówki `libpipewire-0.3`, **cmake**, **clang /
+  libclang**, **Rust**. Na typowej dystrybucji instalujesz je z pakietów:
+  - Fedora: `pipewire-devel clang-devel cmake` (+ `rustup`),
+  - Debian/Ubuntu: `libpipewire-0.3-dev libclang-dev cmake`,
+  - Arch: `pipewire clang cmake rust`.
 
-- PipeWire (daemon) + nagłówki `libpipewire-0.3` — **z Homebrew**
-  (`brew install pipewire`; wersja zgodna z systemową 1.6.8),
-- Rust, cmake, clang/libclang — z Homebrew,
-- piper + polski głos w `~/.local/share/piper` (binarka ma RUNPATH=$ORIGIN,
-  żadnych zmiennych środowiskowych nie trzeba),
+  Autor pracuje na Bazzite (rpm-ostree), gdzie nagłówków nie da się
+  doinstalować systemowo — stąd w `build.sh` ścieżka przez **Homebrew**
+  (`brew install pipewire`, wersja zgodna z systemową 1.6.8). Na zwykłej
+  dystrybucji Homebrew nie jest potrzebne; `build.sh` używa go tylko, jeśli
+  wykryje `HOMEBREW_PREFIX`.
+- **piper** + polski głos `pl_PL-gosia-medium` w `~/.local/share/piper`
+  (binarka piper ma RUNPATH=$ORIGIN, żadnych zmiennych środowiskowych nie
+  trzeba). Binarka: [rhasspy/piper — Releases]; głos:
+  [rhasspy/piper-voices] (`pl/pl_PL/gosia/medium`, pliki `.onnx`
+  i `.onnx.json` obok siebie). Ścieżki zmienisz w `[tts] piper_bin`
+  i `[tts] voice`.
 - zalecany silnik `"llamacpp"` wymaga działającego `llama-server`
   (`llamacpp_host`, domyślnie `http://localhost:8080`) — patrz „Budowanie z
   CUDA" niżej; silnik `"gemini"` (domyślny w kodzie, gdy brak pliku
@@ -83,8 +93,8 @@ curl -L --create-dirs -o models/ggml-small.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin
 ```
 
-`ggml-small` to rozsądny kompromis na CPU. Szybciej (kosztem jakości):
-`ggml-base.bin`. **Nie używaj modeli `*.en`** — są angielsko-tylko i nie
+`ggml-small` to rozsądny kompromis jakości do czasu na GPU. Szybciej
+(kosztem jakości): `ggml-base.bin`. **Nie używaj modeli `*.en`** — są angielsko-tylko i nie
 wykrywają języka.
 
 ## Budowanie
@@ -117,20 +127,25 @@ znalazła bez `LD_LIBRARY_PATH` i bez instalowania czegokolwiek na hoście.
 biblioteka, której się celowo NIE dołącza.
 
 ```sh
-sudo make install     # kopiuje dist/ + models/ do /opt/nacelle-translator (bin/, lib/, models/);
-                      # usuwa ./target przed i po instalacji
+make install          # JEDNO polecenie: czysty build + pakowanie + instalacja
+                      # do /opt/nacelle-translator (bin/, lib/, models/, config);
+                      # usuwa ./target przed i po pakowaniu
 sudo make uninstall
 ```
 
-`make install` tylko kopiuje pliki — nie kompiluje niczego jako root. Zbuduj
-i spakuj (`make build && make dist`, albo bezpośrednio `./build.sh` +
-`./package.sh`) jako zwykły użytkownik wewnątrz distroboxa, dopiero potem
-`sudo make install`.
+**Bez `sudo`.** Reguła `install` sama buduje (`./build.sh --fast`), pakuje
+(`./package.sh`) i dopiero kopiowanie do `/opt` woła `sudo` wewnętrznie —
+dostaniesz jedno pytanie o hasło w trakcie. `sudo make install` zrobiłoby
+cargo/build.sh jako root: pomyliłby właściciela plików w `./target` i mógłby
+nie widzieć CUDA Toolkit spoza `PATH` roota. `make install` uruchamiaj
+wewnątrz distroboxa z Toolkitem (patrz wyżej). `uninstall` to samo
+`sudo rm -rf`, więc tam `sudo` zostaje.
 
 ### Silnik `llamacpp` — llama-server + TranslateGemma-4B-IT
 
-Domyślny silnik tłumaczenia (`engine = "llamacpp"`) potrzebuje osobno
-uruchomionego `llama-server` (część projektu [llama.cpp], budowanego też z
+Zalecany silnik tłumaczenia (`engine = "llamacpp"` — ustawiany ręcznie
+w pliku konfiguracyjnym; domyślną wartością w kodzie jest `"gemini"`)
+potrzebuje osobno uruchomionego `llama-server` (część projektu [llama.cpp], budowanego też z
 CUDA Toolkit — ta sama uwaga o distroboxie co wyżej) z wczytanym modelem:
 
 ```sh
@@ -224,21 +239,68 @@ urządzenia wyjściowego w KDE albo przez `wpctl set-default` — PipeWire
 zapamiętuje ten wybór trwale, więc przy kolejnych uruchomieniach programu
 nie trzeba tego powtarzać.
 
+Uwaga na dwie rzeczy:
+
+- **Aplet głośności KDE UKRYWA węzeł translatora.** Ma `node.virtual=true`,
+  więc pipewire-pulse nie nadaje mu flagi `PA_SINK_HARDWARE`, a plasma-pa ma
+  `filterVirtualDevices` domyślnie włączone. Wybierzesz go przez
+  `wpctl set-default <ID>` (ID z `nacelle-translator devices`) albo
+  w Ustawienia → Dźwięk → Aplikacje, przenosząc konkretną aplikację.
+- **Cel odtwarzania jest ustalany RAZ, przy starcie, i nie podąża za
+  apletem.** Zmiana domyślnego wyjścia w KDE w trakcie pracy nie przepnie
+  translatora — dostaniesz w logu ostrzeżenie z obiema nazwami i trzeba
+  zrestartować program. Wynika to z `DONT_RECONNECT` + `node.link-group`,
+  które wyłączają mechanizm „follow default" WirePlumbera; to ta sama para
+  właściwości, która chroni przed pętlą (niżej).
+
 ## Zabezpieczenie przed pętlą
 
 Gdy „Nacelle Translator (PL)" jest domyślnym wyjściem, strumień wyjściowy
 translatora **nie może** trafić z powrotem do niego. Chronią przed tym:
-`target.object` wskazujący konkretny sprzętowy `node.name`, flaga
-`DONT_RECONNECT` (po zniknięciu celu strumień pada zamiast wracać do
-domyślnego sinka) i wspólna `node.link-group` na obu węzłach — wzorzec
-z `module-loopback`.
+
+- `target.object` wskazujący konkretny sprzętowy `node.name`, **razem
+  z `node.dont-fallback=true`**. Sam `target.object` jest tylko sugestią —
+  gdy dopasowanie nie trafi, WirePlumber przechodzi dalej, aż do domyślnego
+  sinka, którym bywa właśnie translator. `node.dont-fallback` każe mu
+  zamiast tego zgłosić błąd i zniszczyć nasz węzeł, co program zamienia
+  w głośne zakończenie z instrukcją. Koszt: wyłączenie urządzenia
+  wyjściowego (np. słuchawek) kończy translator — świadomie, bo alternatywą
+  było ciche granie w próżnię bez jednego wiersza w logu.
+- wspólna `node.link-group` na obu węzłach (wzorzec z `module-loopback`) —
+  WirePlumber odmawia linkowania węzłów o tej samej wartości i rekurencyjnie
+  wykrywa pętle pośrednie;
+- `DONT_RECONNECT` — po pierwszym udanym zlinkowaniu strumień nie jest
+  przepinany na inny cel;
+- przy automatycznym wyborze celu odfiltrowywane są własne węzły i wszystkie
+  obce wirtualne sinki (akceptowany jest tylko sprzęt `alsa_output.*`
+  / `bluez_output.*`).
+
+## Diagnostyka w logu
+
+Domyślny poziom to `info`; `-v` podnosi do `debug`. Co warto rozpoznać:
+
+- `WARN przepełnienie ringów RT ...` — tor AI albo odtwarzanie nie nadąża
+  i próbki przepadają. Przy zdrowej pracy ta linia nie pada w ogóle.
+- `WARN domyślne wyjście dźwięku zmieniono na ... ale translator gra dalej
+  w ...` — przełączyłeś urządzenie w KDE; zrestartuj translator.
+- `WARN <strumień>: błąd sesyjny od serwera ...` — rutynowy komunikat
+  WirePlumbera (zwykle „no target node available"); program pracuje dalej,
+  komunikat jest dławiony do jednego na 10 s.
+- `ERROR ... węzeł wypadł z grafu — cel odtwarzania "..." zniknął` — koniec
+  pracy; urządzenie wyjściowe przepadło.
+- `DEBUG passthrough: zaległość min/max/ost. ... (kwant ...)` — przyrząd
+  pomiarowy toru RT, widoczny tylko z `-v`. Służy do dobrania rozmiaru
+  bufora wstępnego; nie wpływa na ani jedną próbkę.
 
 ## Ograniczenia (v0.1)
 
-- Tor na CPU; whisper `small` przy ciągłej gęstej mowie może nie nadążać —
-  zaległe segmenty są wtedy sklejane w jedno wywołanie, a w ostateczności
-  odrzucane (widać to w logach). GPU (Vulkan/CUDA) wymagałoby doinstalowania
-  toolchainu — featury `whisper-rs` są na to gotowe.
+- STT idzie na **CUDA** (feature `cuda` jest domyślnie włączona — bez CUDA
+  Toolkit w środowisku budowania build w ogóle nie przejdzie, patrz
+  „Budowanie z CUDA"). Ograniczeniem jest więc przepustowość GPU dzielona
+  z tym, co równolegle na nim liczysz (gra, `llama-server`), a nie CPU:
+  whisper `small` przy ciągłej gęstej mowie może nie nadążać — zaległe
+  segmenty są wtedy sklejane w jedno wywołanie, a w ostateczności odrzucane
+  (widać to w logach).
 - Ducking reaguje na obecność głosu lektora, nie na to, *co* w oryginale
   jest mową — cała ścieżka (muzyka też) jest przyciszana, gdy lektor mówi.
 - Napisy/OSD nie są generowane — tylko dźwięk.
@@ -254,3 +316,5 @@ aktualizować do serii 1.6.x z OHF-Voice/piper1-gpl bez świadomej decyzji
 
 [whisper.cpp]: https://github.com/ggml-org/whisper.cpp
 [piper]: https://github.com/rhasspy/piper
+[rhasspy/piper — Releases]: https://github.com/rhasspy/piper/releases
+[rhasspy/piper-voices]: https://huggingface.co/rhasspy/piper-voices

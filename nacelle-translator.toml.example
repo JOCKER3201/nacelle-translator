@@ -13,7 +13,12 @@
 # to zgadywanka: gdy masz kilka urządzeń, USTAW TO JAWNIE, żeby zawsze trafiać
 # w konkretny sprzęt niezależnie od tego, co PipeWire uzna w danej chwili za
 # "domyślne" (które po ustawieniu translatora jako default to już on sam).
-#output_device = "alsa_output.usb-Logitech_G522_LIGHTSPEED_-_Wireless_Mode_0000000000000000-00.analog-stereo"
+#
+# UWAGA: cel jest ustalany RAZ, przy starcie, i NIE podąża za zmianą
+# wyjścia w aplecie KDE — przepięcie wymaga restartu programu (translator
+# ostrzega w logu, gdy wykryje taki rozjazd). Nazwę bierzesz z:
+#     nacelle-translator devices
+#output_device = "alsa_output.usb-XXXX.analog-stereo"
 passthrough_gain = 1.0   # głośność oryginału bez lektora
 duck_gain = 0.2          # głośność oryginału pod lektorem (0.2 ≈ -14 dB)
 tts_gain = 1.0           # głośność lektora
@@ -101,7 +106,7 @@ engine = "gemini"
 model = "claude-opus-4-8"        # model dla silnika "claude"; taniej: "claude-haiku-4-5"
 gemini_model = "gemini-3.5-flash-lite" # najszybszy wariant — kluczowy dla czasu rzeczywistego
 ollama_host = "http://localhost:11434"
-ollama_model = "gemma"           # tag modelu w Ollamie (u mnie: Gemma 4, Q4_K_M)
+ollama_model = "gemma"           # tag modelu w Ollamie (np. Gemma, Q4_K_M)
 llamacpp_host = "http://localhost:8080" # adres llama-server (uruchamiany z --no-jinja)
 target_language = "polski"       # nazwa języka używana w prompcie
 target_lang_code = "pl"          # kod porównywany z detekcją whispera
