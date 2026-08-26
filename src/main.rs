@@ -174,7 +174,7 @@ fn cmd_run(config_path: &PathBuf, experimental: &experimental::Selection) -> Res
 }
 
 fn cmd_devices() -> Result<()> {
-    let (sinks, default) = pw::discover_sinks()?;
+    let pw::GraphSnapshot { sinks, defaults: default, .. } = pw::discover_sinks()?;
     if sinks.is_empty() {
         println!("brak węzłów Audio/Sink");
         return Ok(());
@@ -367,8 +367,27 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
 
     // pipewire
     match pw::discover_sinks() {
-        Ok((sinks, default)) => {
+        Ok(pw::GraphSnapshot { sinks, defaults: default, session_manager }) => {
             println!("  OK    PipeWire: {} węzłów Audio/Sink", sinks.len());
+            // Bez WirePlumbera `filter.smart` nie znaczy NIC: węzeł powstanie
+            // i zostanie niezlinkowany. To jedyna twarda zależność runtime,
+            // której `check` wcześniej w ogóle nie sprawdzał — i drukował
+            // zielone OK komuś, kto potem nie usłyszy nic.
+            match session_manager.as_deref() {
+                Some(n) if n.starts_with("WirePlumber") => {
+                    println!("  OK    menedżer sesji: {n} (realizuje filter.smart)")
+                }
+                Some(n) => println!(
+                    "  UWAGA menedżer sesji to \"{n}\", a nie WirePlumber — `filter.smart` \
+                     jest polityką WirePlumbera >= 0.5.\n        Bez niego węzeł powstanie, \
+                     ale nikt go nie zlinkuje i translator będzie niemy."
+                ),
+                None => println!(
+                    "  UWAGA nie widzę w grafie klienta WirePlumbera. Jeśli menedżerem sesji \
+                     nie jest WirePlumber >= 0.5,\n        `filter.smart` nie zadziała i \
+                     translator będzie niemy (sprawdź: wireplumber --version)."
+                ),
+            }
             // OBA klucze osobno. `default.audio.sink` (aktywny) decyduje
             // o routingu, `default.configured.audio.sink` to zapamiętany wybór
             // użytkownika i potrafi wskazywać sprzęt, którego nie ma w grafie.

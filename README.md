@@ -86,7 +86,8 @@ więc obraz się nie rozjeżdża — spóźnia się tylko głos lektora.
   w serii 0.5) jest jedyną rzeczą, która wpina translator w tor dźwięku.
   Z `pipewire-media-session` albo bez menedżera sesji węzeł powstanie, ale
   nikt go z niczym nie zlinkuje i translator będzie niemy. Sprawdzisz przez
-  `wireplumber --version`.
+  `wireplumber --version`; `nacelle-translator check` też wypisuje, jaki
+  menedżer sesji widzi w grafie.
 - **PipeWire** (daemon) + nagłówki `libpipewire-0.3`, **cmake**, **clang /
   libclang**, **Rust**. Na typowej dystrybucji instalujesz je z pakietów:
   - Fedora: `pipewire-devel clang-devel cmake` (+ `rustup`),

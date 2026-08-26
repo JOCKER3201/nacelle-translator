@@ -478,16 +478,33 @@ fn format_pod_bytes() -> Vec<u8> {
 fn enumerate_sinks(
     mainloop: &pw::main_loop::MainLoopRc,
     core: &pw::core::CoreRc,
-) -> Result<Vec<SinkInfo>> {
+) -> Result<(Vec<SinkInfo>, Option<String>)> {
     let registry = core.get_registry_rc()?;
     let sinks = Rc::new(RefCell::new(Vec::<SinkInfo>::new()));
+    // Menedżer sesji: przy okazji tej samej enumeracji, bo to od NIEGO zależy,
+    // czy `filter.smart` w ogóle coś znaczy (patrz `session_manager`).
+    let session_mgr: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let core_err: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
     let _reg_listener = registry
         .add_listener_local()
         .global({
             let sinks = sinks.clone();
+            let session_mgr = session_mgr.clone();
             move |g| {
+                if g.type_ == pw::types::ObjectType::Client {
+                    if let Some(name) = g.props.and_then(|p| p.get("application.name")) {
+                        // „WirePlumber [export]" to ten sam proces — bierzemy
+                        // pierwszą nazwę i nie doklejamy duplikatów.
+                        if session_mgr.borrow().is_none()
+                            && (name.starts_with("WirePlumber")
+                                || name.contains("media-session"))
+                        {
+                            *session_mgr.borrow_mut() = Some(name.to_string());
+                        }
+                    }
+                    return;
+                }
                 if g.type_ != pw::types::ObjectType::Node {
                     return;
                 }
@@ -531,7 +548,7 @@ fn enumerate_sinks(
     if let Some(msg) = core_err.take() {
         bail!("połączenie z PipeWire przerwane podczas enumeracji węzłów: {msg}");
     }
-    Ok(sinks.take())
+    Ok((sinks.take(), session_mgr.take()))
 }
 
 /// Odczytuje (WYŁĄCZNIE do odczytu — żadnego zapisu do metadanych, żadnego
@@ -797,14 +814,33 @@ impl DefaultSinkWatch {
 
 /// Enumeracja węzłów Audio/Sink + odczyt aktualnie skonfigurowanego
 /// domyślnego wyjścia, w jednej sesji (podkomendy `devices` i `check`).
-pub fn discover_sinks() -> Result<(Vec<SinkInfo>, DefaultSinks)> {
+pub fn discover_sinks() -> Result<GraphSnapshot> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
-    let sinks = enumerate_sinks(&mainloop, &core)?;
-    let (default, _watch) = read_default_sink_name(&mainloop, &core);
-    Ok((sinks, default))
+    let (sinks, session_manager) = enumerate_sinks(&mainloop, &core)?;
+    let (defaults, _watch) = read_default_sink_name(&mainloop, &core);
+    Ok(GraphSnapshot {
+        sinks,
+        defaults,
+        session_manager,
+    })
+}
+
+/// Jednorazowa migawka grafu dla podkomend `devices` i `check`.
+pub struct GraphSnapshot {
+    pub sinks: Vec<SinkInfo>,
+    pub defaults: DefaultSinks,
+    /// Nazwa klienta menedżera sesji, jeśli jest w grafie.
+    ///
+    /// Po co: cały model przelotki stoi na politykach Lua WirePlumbera —
+    /// `filter.smart` jest tym, co w ogóle wpina nas w tor. Bez WirePlumbera
+    /// (goły PipeWire, `pipewire-media-session`, własna polityka) węzeł
+    /// powstanie i nikt go z niczym nie zlinkuje. Bez tego odczytu `check`
+    /// drukował „OK translator wepnie się w aktualne domyślne wyjście
+    /// (filter.smart)" KAŻDEMU, także temu, u kogo nie ma czego wpiąć.
+    pub session_manager: Option<String>,
 }
 
 /// Plik stanu WirePlumbera z zapamiętanym wyborem wyjścia (względem $HOME).
