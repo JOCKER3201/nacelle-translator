@@ -1724,20 +1724,22 @@ mod tests {
         assert_eq!(s.take().unwrap().quantum_frames, 0);
     }
 
-    /// Realny kształt pliku ~/.local/state/wireplumber/default-nodes w chwili,
-    /// gdy użytkownik ma ustawiony NASZ węzeł jako domyślne wyjście.
+    /// Kształt pliku ~/.local/state/wireplumber/default-nodes w chwili, gdy
+    /// użytkownik ma ustawiony NASZ węzeł jako domyślne wyjście. Nazwy
+    /// urządzeń są przykładowe — dla asercji liczy się wyłącznie to, który
+    /// indeks wygrywa, a nie jaki sprzęt się pod nim kryje.
     const STATE: &str = "\
 [default-nodes]
 default.configured.audio.sink=nacelle-translator-sink
-default.configured.audio.sink.0=alsa_output.usb-Logitech.analog-stereo
-default.configured.audio.sink.1=alsa_output.pci-0000_73_00.6.analog-stereo
+default.configured.audio.sink.0=alsa_output.usb-Przyklad.analog-stereo
+default.configured.audio.sink.1=alsa_output.pci-0000_00_1f.3.analog-stereo
 ";
 
     #[test]
     fn p1_stos_wyborow_daje_poprzednie_urzadzenie() {
         assert_eq!(
             previous_configured_sink(STATE).as_deref(),
-            Some("alsa_output.usb-Logitech.analog-stereo")
+            Some("alsa_output.usb-Przyklad.analog-stereo")
         );
     }
 

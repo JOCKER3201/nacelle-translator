@@ -40,8 +40,8 @@ aplikacje ──▶ [Nacelle Translator (PL)]  (smart filter, media.class=Audio/
                                      (STT, CUDA)    (tłumaczenie)   (głos pl)
                                                                     │
     AKTUALNE domyślne wyjście ◀── [nacelle-translator-out] ◀─ mikser ┘
-    (cel wybiera WirePlumber,       (strumień Playback, node.passive)
-     przepina bez restartu)
+    (cel wybiera WirePlumber,       (strumień Playback; node.passive
+     przepina bez restartu)          dokładany tylko przy translate = false)
 ```
 
 Gałąź AI (od `rubato` w dół) **w ogóle nie powstaje** przy
