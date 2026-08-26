@@ -62,7 +62,9 @@ pub struct VadCfg {
     /// muzycznym Silero nie schodzi poniżej threshold_exit nawet na
     /// granicach fraz, ale dołki 0.4-0.6 tam występują
     pub dip_threshold: f32,
-    /// NIEZMIENNIK: `hard_max_ms - soft_max_ms >= 2000`.
+    /// NIEZMIENNIK: `hard_max_ms - soft_max_ms >= 2000`. NIC go nie waliduje
+    /// (jedyny sprawdzian strojenia to `tuning_warning`, o czym innym) —
+    /// jego jedynym strażnikiem jest ten komentarz.
     ///
     /// Cięcie w ustabilizowanym dołku może odpalić NAJWCZEŚNIEJ w chwili
     /// soft_max_ms — dołki są śledzone dopiero od `soft_max - dip_settle`
@@ -76,7 +78,10 @@ pub struct VadCfg {
     /// śledzenia. Różni się powód odpalenia: zamiast akustyki (p poniżej
     /// dip_threshold utrzymane przez dip_settle_ms) decyduje limit czasu,
     /// więc bierzemy minimum takie, jakie akurat jest — bywa płytkie
-    /// i wtedy wypada wewnątrz frazy zamiast na jej granicy.
+    /// i wtedy wypada wewnątrz frazy zamiast na jej granicy. To zdanie
+    /// obowiązuje tylko póki `hard_max_ms > soft_max_ms - dip_settle_ms`:
+    /// poniżej tej granicy okno śledzenia nie zdąży się zacząć i twarde
+    /// cięcie faktycznie idzie na końcu bufora, z pustym ogonem.
     /// Zmierzony w audycie rozkład czekania na ustabilizowany dołek, liczony
     /// od soft_max: mediana 0.65 s, p90 1.33 s, p95 1.60 s, max 1.70 s —
     /// czyli 2.0 s to p95 + 0.4 s marginesu i daje obserwowane 6 % domknięć

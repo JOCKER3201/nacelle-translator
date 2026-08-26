@@ -24,25 +24,47 @@ pub struct Utterance {
     /// oznacza, że podkład trzyma p nad progami i VAD nie ma się o co
     /// zaczepić. UWAGA: rozstrzyga o tym `p_dip`, a NIE `p_min` — patrz niżej.
     pub reason: CloseReason,
-    /// najniższe p zaobserwowane w segmencie. Liczone od poprzedniego
-    /// domknięcia po KAŻDYM chunku, więc obejmuje też czas SPRZED okna
-    /// śledzenia dołków (a przy cięciu wymuszonym również chunki ogona
-    /// zarejestrowane już po punkcie cięcia). Dlatego niskie `p_min` NIE
-    /// dowodzi, że w oknie śledzenia był dołek nadający się do cięcia —
-    /// głębokie minima potrafią leżeć w całości przed oknem.
+    /// najniższe p zaobserwowane w segmencie. Zakres liczenia: od PIERWSZEGO
+    /// chunka MOWY bieżącego segmentu (albo od cięcia wymuszonego) po każdym
+    /// kolejnym chunku aż do domknięcia. Chunki PREROLLU są w buforze audio,
+    /// ale w tej statystyce ich NIE MA — `note_p` woła się dopiero od chunka
+    /// wyzwalającego. Statystyka obejmuje za to czas SPRZED okna śledzenia
+    /// dołków (a przy cięciu wymuszonym również chunki ogona zarejestrowane
+    /// już po punkcie cięcia). Dlatego niskie `p_min` NIE dowodzi, że w oknie
+    /// śledzenia był dołek nadający się do cięcia — głębokie minima potrafią
+    /// leżeć w całości przed oknem.
     pub p_min: f32,
     /// średnie p w segmencie (ten sam zakres liczenia co `p_min`)
     pub p_mean: f32,
-    /// ile chunków objęła statystyka `p_min`/`p_mean`. Bez tego p̄ sugeruje
-    /// pokrycie całego bufora, a przy cięciu wymuszonym liczniki startują od
-    /// zera zaraz po cięciu, choć bufor ogona zawiera już nakładkę i ogon:
-    /// `p_n * 32 ms` mówi wprost, ile audio ta statystyka naprawdę opisuje.
+    /// ile chunków objęła statystyka `p_min`/`p_mean`; `p_n * 32 ms` mówi
+    /// wprost, ile audio ta statystyka naprawdę opisuje. Bez tego p̄ sugeruje
+    /// pokrycie całego bufora, a rozjazd jest systematyczny z DWÓCH powodów:
+    /// (1) zawsze krótsze od bufora o faktycznie wlany preroll (do
+    /// `preroll_ms`, przy domyślnych 300 ms to 9 chunków = 288 ms), bo
+    /// preroll nie przechodzi przez `note_p`; (2) po cięciu wymuszonym
+    /// liczniki startują od zera, choć bufor ogona zawiera już nakładkę
+    /// i ogon sprzed cięcia.
+    ///
+    /// POLE WYŁĄCZNIE DO LOGOWANIA — nie wolno go czytać w żadnym predykacie
+    /// decydującym o cięciu (o tym rozstrzygają wyłącznie `silence_ms`,
+    /// `settled_dip`, `hard_max_ms` i `min_speech_ms || tail_of_forced_cut`).
     pub p_n: u32,
     /// p DOKŁADNIE w punkcie cięcia (dno dołka, w którym przecięliśmy bufor).
     /// `None` dla domknięć nie-wymuszonych: pauza i mikropauza kończą segment
     /// na jego końcu, a nie w wybranym dołku — nie ma tam "punktu cięcia"
-    /// w tym sensie. To jedyna liczba rozstrzygająca, czy inny
-    /// `dip_threshold` cokolwiek by zmienił przy cięciach hard-max.
+    /// w tym sensie. `None` bywa też przy cięciu WYMUSZONYM, jeśli okno
+    /// śledzenia dołków jeszcze się nie zaczęło (`dip == None`) — to możliwe
+    /// tylko przy konfiguracji łamiącej niezmiennik z `config.rs`
+    /// (`hard_max_ms > soft_max_ms - dip_settle_ms`), którego nic nie
+    /// waliduje; wtedy hard-max tnie na końcu bufora, a ogon jest pusty.
+    /// To jedyna liczba rozstrzygająca, czy inny `dip_threshold` cokolwiek
+    /// by zmienił przy cięciach hard-max — ale rozstrzyga się to ANALIZĄ
+    /// LOGÓW, nie w kodzie.
+    ///
+    /// POLE WYŁĄCZNIE DO LOGOWANIA — nie wolno go czytać w żadnym predykacie
+    /// decydującym o cięciu (lista predykatów jak przy `p_n` wyżej). Wpięcie
+    /// go w decyzję zmienia zachowanie toru i unieważnia porównania z już
+    /// zebranymi logami.
     pub p_dip: Option<f32>,
 }
 
@@ -56,13 +78,18 @@ pub enum CloseReason {
     /// dip_threshold i utrzymało się przez dip_settle_ms
     SettledDip,
     /// twarde cięcie przy hard_max_ms. NIE znaczy "żaden dołek się nie
-    /// trafił" i NIE tnie w dowolnym miejscu: punkt cięcia jest DOKŁADNIE
-    /// ten sam co przy SettledDip — biegnące minimum p okna śledzenia
-    /// (wspólne `cut` w `maybe_force_cut`). Różni się wyłącznie powód
-    /// odpalenia: to minimum nie spełniło dip_threshold albo nie zdążyło
-    /// przetrwać dip_settle_ms, więc o chwili cięcia zdecydował limit
-    /// długości, a nie akustyka — dołek bywa wtedy płytki i wypada
-    /// wewnątrz frazy.
+    /// trafił" i NIE tnie w dowolnym miejscu: punkt cięcia jest ten sam co
+    /// przy SettledDip — biegnące minimum p okna śledzenia (wspólne `cut`
+    /// w `maybe_force_cut`). Różni się wyłącznie powód odpalenia: to minimum
+    /// nie spełniło dip_threshold albo nie zdążyło przetrwać dip_settle_ms,
+    /// więc o chwili cięcia zdecydował limit długości, a nie akustyka —
+    /// dołek bywa wtedy płytki i wypada wewnątrz frazy.
+    ///
+    /// ZASTRZEŻENIE: powyższe obowiązuje, dopóki trzymany jest niezmiennik
+    /// z `config.rs` (`hard_max_ms > soft_max_ms - dip_settle_ms`), którego
+    /// NIC nie waliduje. Przy jego naruszeniu hard_max odpala, zanim okno
+    /// śledzenia w ogóle się zacznie — wtedy cięcie idzie na końcu bufora,
+    /// z pustym ogonem i `p_dip == None`.
     HardMax,
 }
 
@@ -142,9 +169,11 @@ impl Segmenter {
     }
 
     /// (p_min, p_mean, p_n) bieżącego segmentu + reset liczników pod następny.
-    /// `p_n` wychodzi na zewnątrz, bo po cięciu wymuszonym liczniki startują
-    /// od zera, a bufor ogona już zawiera audio (nakładka + ogon) — bez tej
-    /// liczby p̄ ogona wygląda, jakby opisywało cały bufor.
+    /// `p_n` wychodzi na zewnątrz, bo statystyka nigdy nie pokrywa całego
+    /// bufora: preroll wlewa się do `seg` z pominięciem `note_p`, a po cięciu
+    /// wymuszonym liczniki startują od zera, choć bufor ogona już zawiera
+    /// audio (nakładka + ogon) — bez tej liczby p̄ wygląda, jakby opisywało
+    /// cały bufor.
     fn take_p_stats(&mut self) -> (f32, f32, u32) {
         let mean = if self.p_n > 0 {
             (self.p_sum / self.p_n as f64) as f32
@@ -335,11 +364,21 @@ impl Segmenter {
         // od `soft_max - dip_settle`, więc przy `seg_ms >= hard_max` dołek
         // praktycznie zawsze istnieje — po prostu nie zszedł poniżej
         // dip_threshold albo nie zdążył przeżyć dip_settle_ms. Obie ścieżki
-        // tną w TYM SAMYM punkcie (wspólne `cut` niżej = biegnące minimum p
-        // okna); hard_max zmienia wyłącznie to, że przestajemy czekać na
-        // spełnienie warunków dołka. Gałąź `unwrap_or(self.seg.len())` jest
-        // w praktyce martwa i zostaje tylko jako asekuracja, gdyby okno
-        // śledzenia kiedyś się przesunęło.
+        // tną wtedy w TYM SAMYM punkcie (wspólne `cut` niżej = biegnące
+        // minimum p okna); hard_max zmienia wyłącznie to, że przestajemy
+        // czekać na spełnienie warunków dołka.
+        //
+        // Ale to zdanie jest prawdziwe WARUNKOWO — tylko przy zachowanym
+        // niezmienniku z config.rs `hard_max_ms > soft_max_ms - dip_settle_ms`,
+        // którego NIC w kodzie nie sprawdza (jedyna walidacja strojenia to
+        // `Config::tuning_warning`, o czym innym). Konfiguracja np.
+        // soft_max=6000 / dip_settle=500 / hard_max=4000 przechodzi przez
+        // parser bez słowa protestu, a wtedy przy seg_ms >= hard_max okno
+        // śledzenia jeszcze się nie zaczęło, `dip` jest None i gałąź
+        // `unwrap_or(self.seg.len())` NIE jest martwa: hard-max tnie na końcu
+        // bufora, ogon wychodzi pusty, a `p_dip` None mimo `forced: true`.
+        // Przy domyślnym strojeniu ta gałąź się nie wykonuje i zostaje jako
+        // asekuracja właśnie na taki rozjazd konfiguracji.
         let settled_dip = self.dip.is_some_and(|(_, p, at_ms)| {
             p <= self.cfg.dip_threshold
                 && self.seg_ms.saturating_sub(at_ms) >= self.cfg.dip_settle_ms
@@ -374,11 +413,12 @@ impl Segmenter {
             None => State::Speech,
         };
 
-        // statystyki dotyczą wszystkich chunków od poprzedniego domknięcia
-        // (głowa + zarejestrowany dotąd ogon) — dla diagnostyki wystarczające;
-        // ogon zaczyna liczyć od zera, więc jego przyszłe p̄/pmin opiszą tylko
-        // audio zarejestrowane PO cięciu, mimo że bufor ma już nakładkę
-        // i ogon — stąd `p_n` w Utterance, żeby było widać pokrycie
+        // statystyki dotyczą chunków zarejestrowanych przez `note_p` od
+        // poprzedniego domknięcia (głowa BEZ prerollu + zarejestrowany dotąd
+        // ogon) — dla diagnostyki wystarczające; ogon zaczyna liczyć od zera,
+        // więc jego przyszłe p̄/pmin opiszą tylko audio zarejestrowane PO
+        // cięciu, mimo że bufor ma już nakładkę i ogon — stąd `p_n`
+        // w Utterance, żeby było widać pokrycie
         let (p_min, p_mean, p_n) = self.take_p_stats();
         self.tail_of_forced_cut = true;
         // M1: cięcie wymuszone łamie założenie append-only bufora — nowy
@@ -540,7 +580,25 @@ mod tests {
         let u = speak_and_close(&mut s, 4).expect("segment domknięty");
         assert!(!u.forced);
         assert!(u.p_dip.is_none());
-        // 4 chunki mowy + 2 ciszy
+        // 4 chunki mowy + 2 ciszy; preroll pusty (pierwszy segment sesji)
+        assert_eq!(u.p_n, 6);
+        assert_eq!(u.audio.len(), 6 * VAD_CHUNK);
+    }
+
+    // V2e: preroll jest w BUFORZE, ale nie w statystyce p — `p_n * 32 ms`
+    // jest systematycznie krótsze od segmentu o wlany preroll. Bez tego
+    // testu komentarz przy `p_n` mówiłby co innego niż kod, a czytelnik
+    // logu wziąłby stały rozjazd ~preroll_ms za nowy błąd.
+    #[test]
+    fn v2e_preroll_nie_wchodzi_do_statystyki_p() {
+        let mut s = Segmenter::new(cfg()); // preroll_ms = 32 → 1 chunk
+        let c = chunk(0.0);
+        // cisza przed mową trafia do kolejki prerollu (bez note_p)
+        assert!(s.push_chunk(&c, 0.0).is_none());
+        let u = speak_and_close(&mut s, 4).expect("segment domknięty");
+        // bufor: 1 preroll + 4 mowy + 2 ciszy = 7 chunków
+        assert_eq!(u.audio.len(), 7 * VAD_CHUNK);
+        // statystyka: tylko 6 — preroll pominięty
         assert_eq!(u.p_n, 6);
     }
 

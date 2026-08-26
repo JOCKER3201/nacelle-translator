@@ -38,6 +38,7 @@ soft_max_ms = 2000       # od tej długości: (1) szukamy dołka do cięcia,
                          # (2) obowiązuje soft_hangover_ms zamiast hangover_ms
                          #
                          # NIEZMIENNIK: hard_max_ms - soft_max_ms >= 2000.
+                         # Nic go nie waliduje — pilnuj go sam przy strojeniu.
                          # Cięcie w ustabilizowanym dołku może odpalić najwcześniej
                          # w chwili soft_max_ms, więc okno wyścigu do twardego
                          # cięcia to dokładnie ta różnica; zejście poniżej niej
@@ -61,10 +62,14 @@ soft_max_ms = 2000       # od tej długości: (1) szukamy dołka do cięcia,
                          # sposób, w jaki plik zostaje po drugim wariancie.
 hard_max_ms = 8000       # twarde cięcie ciągłej mowy — sufit czasu, gdy nie trafi
                          # się pauza ani dołek dość głęboki (dip_threshold)
-                         # i dość stabilny (dip_settle_ms). Dołek jako miejsce
-                         # cięcia prawie zawsze JEST — tnie się w biegnącym
-                         # minimum p okna także tutaj; hard_max mówi tylko, że
-                         # przestajemy czekać na lepszy
+                         # i dość stabilny (dip_settle_ms). Przy zachowanym
+                         # niezmienniku wyżej dołek jako MIEJSCE cięcia zawsze
+                         # JEST — tnie się w biegnącym minimum p okna także
+                         # tutaj, hard_max mówi tylko, że przestajemy czekać
+                         # na lepszy. Gdy hard_max zejdzie PONIŻEJ
+                         # soft_max - dip_settle, okno śledzenia nie zdąży się
+                         # zacząć i twarde cięcie idzie na końcu bufora — to
+                         # dopiero jest cięcie "w losowym miejscu"
 overlap_ms = 250         # nakładka przenoszona po wymuszonym cięciu
 
 [stt]

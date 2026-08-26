@@ -321,9 +321,14 @@ fn segmenter_thread(
                 // głęboki był dołek, w którym faktycznie przecięliśmy bufor —
                 // pmin obejmuje CAŁY segment (także czas sprzed okna śledzenia
                 // dołków), więc nie odpowiada na to pytanie. p_n to liczba
-                // chunków objętych statystyką (32 ms każdy) — po cięciu
-                // wymuszonym liczniki startują od zera, więc p̄ nie opisuje
-                // całego bufora następnego segmentu.
+                // chunków objętych statystyką (32 ms każdy). UWAGA przy
+                // czytaniu logu: `p_n * 32 ms` jest ZAWSZE krótsze od `secs`
+                // o faktycznie wlany preroll (do preroll_ms — preroll nie
+                // przechodzi przez note_p), także przy zwykłych domknięciach
+                // pauzą; po cięciu wymuszonym dochodzi jeszcze nakładka i ogon
+                // sprzed cięcia, bo liczniki startują wtedy od zera. Rozjazd
+                // WIĘKSZY niż preroll + nakładka to znak, że coś jeszcze jest
+                // niezrozumiane — nie że p_n kłamie.
                 let p_cut = match utt.p_dip {
                     Some(p) => format!("{p:.2}"),
                     None => "-".to_string(),
