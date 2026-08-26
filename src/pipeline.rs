@@ -20,8 +20,6 @@ use anyhow::Result;
 use crossbeam_channel as chan;
 use ringbuf::{traits::*, HeapCons, HeapProd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use voice_activity_detector::VoiceActivityDetector;
 
@@ -33,17 +31,6 @@ const COALESCE_GAP_SAMPLES: usize = VAD_RATE * 3 / 10; // 0.3 s
 /// a segmenter ma otwartą wypowiedź, wstrzykujemy ciszę, żeby hangover mógł
 /// ją domknąć — inaczej wisi w nieskończoność i skleja się z następną mową
 const SILENCE_INJECT_AFTER: Duration = Duration::from_millis(200);
-/// Po tylu ms bez ANI JEDNEJ próbki z sinka uznajemy, że źródło się skończyło
-/// (koniec filmu / zatrzymane odtwarzanie), i resztę kolejki puszczamy w tempie
-/// doganiania: nie ma już obrazu, z którym lektor ma trzymać synchronizację,
-/// więc jedyne, co się liczy, to szybkie wybrzmienie zaległości (audyt: ogon
-/// 10,6 s przy obciążeniu kanału lektora 97,1 %).
-/// 5× SILENCE_INJECT_AFTER (niezmiennik: DRAIN_AFTER > SILENCE_INJECT_AFTER,
-/// żeby drenaż nigdy nie wyprzedził wstrzyknięcia ciszy domykającego segment):
-/// zwykłe zagłodzenie bufora w trakcie odtwarzania trwa milisekundy, a pauza
-/// MÓWCY w ogóle tu nie dociera — aplikacja gra dalej i sink produkuje wtedy
-/// próbki ciszy, czyli `pop_slice` zwraca n > 0 i licznik się zeruje.
-const DRAIN_AFTER: Duration = Duration::from_millis(1_000);
 /// zadanie starsze niż to (liczone od zamknięcia segmentu przez VAD) jest
 /// porzucane zamiast płynąć dalej przez STT/MT/TTS — inaczej opóźnienie
 /// rośnie bez ograniczeń, a lektor czyta treść sprzed minut zamiast bieżącej.
@@ -165,21 +152,15 @@ pub fn spawn(
     let (tts_tx, tts_rx) = chan::bounded::<TtsJob>(1);
     let (health_tx, health_rx) = chan::bounded::<String>(4);
 
-    // Tempo drenażu jest wyłącznie podpowiedzią dla doboru procesu pipera —
-    // brak wymagań happens-before, najgorszy skutek rozjazdu to JEDEN klip
-    // w niewłaściwym tempie. Stąd Relaxed.
-    let draining = Arc::new(AtomicBool::new(false));
-
     let seg_cfg = cfg.vad.clone();
     let seg_stt_cfg = cfg.stt.clone();
     let health = HealthGuard {
         name: "segmenter",
         tx: health_tx.clone(),
     };
-    let seg_draining = Arc::clone(&draining);
     std::thread::Builder::new().name("segmenter".into()).spawn(move || {
         let _health = health;
-        segmenter_thread(cap_cons, vad, seg_cfg, seg_stt_cfg, seg_tx, part_tx, seg_draining);
+        segmenter_thread(cap_cons, vad, seg_cfg, seg_stt_cfg, seg_tx, part_tx);
     })?;
 
     let stt_cfg = cfg.stt.clone();
@@ -213,7 +194,6 @@ pub fn spawn(
         let _health = health;
         tts_thread(
             piper, piper_fast, tts_cfg, fast_cfg, piper_bin, piper_voice, tts_rx, tts_prod,
-            draining,
         );
     })?;
 
@@ -227,7 +207,6 @@ fn segmenter_thread(
     stt_cfg: crate::config::SttCfg,
     seg_tx: chan::Sender<SttJob>,
     part_tx: chan::Sender<PartialJob>,
-    draining: Arc<AtomicBool>,
 ) {
     /// długość chunka segmentera w ms — jednostka kadencji spekulacji
     const CHUNK_MS: u32 = (VAD_CHUNK * 1000 / VAD_RATE) as u32; // 32 ms
@@ -245,10 +224,6 @@ fn segmenter_thread(
     let mut chunk = vec![0.0f32; VAD_CHUNK];
     let mut next_id: u64 = 1;
     let mut dropped: u64 = 0;
-    // bez tego drenaż zapalałby się przy KAŻDYM starcie programu, zanim
-    // cokolwiek zagra (sink milczy od uruchomienia), i produkował mylącą
-    // linię logu w każdym uruchomieniu
-    let mut ever_had_audio = false;
     // kadencja spekulacji: akumulator ms czasu audio od ostatniej migawki
     let mut cadence_acc: u32 = 0;
     let mut part_dropped: u64 = 0;
@@ -275,34 +250,9 @@ fn segmenter_thread(
                         buf[got..need].fill(0.0);
                         break;
                     }
-                    // Drenaż zapala się dopiero PO domknięciu ostatniego
-                    // segmentu: przy otwartej wypowiedzi wychodzimy wyżej
-                    // przez `break`, a `starved_for` startuje od zera przy
-                    // każdym napełnianiu bufora — więc licznik nie zdąży
-                    // urosnąć do DRAIN_AFTER nigdy w środku wypowiedzi.
-                    if ever_had_audio
-                        && starved_for >= DRAIN_AFTER
-                        && !draining.load(Ordering::Relaxed)
-                    {
-                        draining.store(true, Ordering::Relaxed);
-                        log::info!(
-                            "źródło milczy {:.1}s — tryb drenażu: reszta kolejki \
-                             w tempie doganiania",
-                            starved_for.as_secs_f32()
-                        );
-                    }
                     std::thread::sleep(Duration::from_millis(5));
                     starved_for += Duration::from_millis(5);
                 } else {
-                    ever_had_audio = true;
-                    // pierwsza próbka po zagłodzeniu = odtwarzanie wróciło:
-                    // natychmiastowy powrót do tempa nominalnego, bez histerezy
-                    // czasowej w drugą stronę (fałszywy drenaż ma kosztować
-                    // najwyżej jeden klip przeczytany szybciej)
-                    if draining.load(Ordering::Relaxed) {
-                        draining.store(false, Ordering::Relaxed);
-                        log::info!("źródło znów gra — powrót do tempa nominalnego lektora");
-                    }
                     starved_for = Duration::ZERO;
                 }
             }
@@ -883,23 +833,15 @@ enum Tempo {
     Nominalne,
     /// zaległość zadania albo rozdęte tłumaczenie
     Doganianie,
-    /// źródło przestało grać — nie ma z czym trzymać synchronizacji obrazu
-    Drenaz,
 }
 
-/// Wydzielone z tts_thread jako funkcja czysta — decyzja o tempie jest jedynym
-/// miejscem, w które wchodzi flaga drenażu, i musi dać się sprawdzić testem
-/// bez procesów pipera i bez wątków.
-///
-/// Kolejność gałęzi jest istotna: gdy zaległość LUB rozdęcie już wymusza
-/// doganianie, etykieta w logu zostaje dotychczasowa („tryb doganiania"),
-/// żeby nie unieważnić skryptów porównawczych z audytu (51 % klipów sesji).
-fn pick_tempo(age: Duration, chars: usize, orig_secs: f32, draining: bool) -> Tempo {
+/// Wydzielone z tts_thread jako funkcja czysta — wybór tempa to jedyna decyzja
+/// tego wątku zależna od danych, a tak daje się sprawdzić testem bez procesów
+/// pipera i bez wątków.
+fn pick_tempo(age: Duration, chars: usize, orig_secs: f32) -> Tempo {
     let oversized = chars as f32 / orig_secs.max(0.5) > 30.0;
     if age > CATCHUP_AFTER || oversized {
         Tempo::Doganianie
-    } else if draining {
-        Tempo::Drenaz
     } else {
         Tempo::Nominalne
     }
@@ -950,7 +892,6 @@ fn tts_thread(
     piper_voice: PathBuf,
     tts_rx: chan::Receiver<TtsJob>,
     mut tts_prod: HeapProd<f32>,
-    draining: Arc<AtomicBool>,
 ) {
     let mut upsampler =
         match ClipResampler::new(piper.sample_rate as usize, crate::pw::RATE as usize) {
@@ -987,15 +928,8 @@ fn tts_thread(
         // wypowiedzieć — typowy owoc halucynacji MT na zniekształconej
         // transkrypcji) idzie w tempie doganiania NIEZALEŻNIE od zaległości:
         // normalne tempo przy ~20 zn/s odtwarzania oznacza, że taki klip
-        // sam z siebie tworzy kilkusekundowy dług. Drenaż (źródło przestało
-        // grać) przyspiesza odczyt nawet bez zaległości — po końcu materiału
-        // nie ma już obrazu, z którym lektor miałby trzymać synchronizację.
-        let tempo = pick_tempo(
-            age,
-            job.text.chars().count(),
-            job.orig_secs,
-            draining.load(Ordering::Relaxed),
-        );
+        // sam z siebie tworzy kilkusekundowy dług.
+        let tempo = pick_tempo(age, job.text.chars().count(), job.orig_secs);
         let behind = tempo != Tempo::Nominalne;
         let t0 = Instant::now();
         let clip = {
@@ -1056,7 +990,6 @@ fn tts_thread(
             match tempo {
                 Tempo::Nominalne => "",
                 Tempo::Doganianie => ", tryb doganiania",
-                Tempo::Drenaz => ", tryb drenażu",
             }
         );
         // push z czekaniem — ring daje naturalny backpressure
@@ -1075,17 +1008,16 @@ fn tts_thread(
 mod tests {
     use super::*;
 
-    /// tempo nominalne: świeże zadanie, tłumaczenie mieszczące się w oryginale,
-    /// źródło gra
+    /// tempo nominalne: świeże zadanie, tłumaczenie mieszczące się w oryginale
     #[test]
     fn p1_tempo_nominalne_bez_zaleglosci() {
-        let t = pick_tempo(Duration::from_millis(100), 30, 3.0, false);
+        let t = pick_tempo(Duration::from_millis(100), 30, 3.0);
         assert_eq!(t, Tempo::Nominalne);
     }
 
     #[test]
     fn p2_zaleglosc_wlacza_doganianie() {
-        let t = pick_tempo(Duration::from_millis(1_500), 30, 3.0, false);
+        let t = pick_tempo(Duration::from_millis(1_500), 30, 3.0);
         assert_eq!(t, Tempo::Doganianie);
     }
 
@@ -1096,24 +1028,7 @@ mod tests {
     /// była widoczna.
     #[test]
     fn p3_rozdete_tlumaczenie_wlacza_doganianie() {
-        let t = pick_tempo(Duration::from_millis(100), 100, 1.0, false);
-        assert_eq!(t, Tempo::Doganianie);
-    }
-
-    /// rekomendacja 7: po końcu materiału przyspieszamy nawet przy zerowej
-    /// zaległości — nie ma już obrazu, z którym lektor ma trzymać synchronizację
-    #[test]
-    fn p4_drenaz_przyspiesza_bez_zaleglosci() {
-        let t = pick_tempo(Duration::from_millis(100), 30, 3.0, true);
-        assert_eq!(t, Tempo::Drenaz);
-    }
-
-    /// dowód, że dotychczasowe linie logu się nie zmieniają: gdy zaległość już
-    /// wymusza doganianie, drenaż nie przejmuje etykiety (skrypty porównawcze
-    /// audytu liczą wystąpienia „tryb doganiania")
-    #[test]
-    fn p5_doganianie_ma_pierwszenstwo_przed_etykieta_drenazu() {
-        let t = pick_tempo(Duration::from_millis(1_500), 30, 3.0, true);
+        let t = pick_tempo(Duration::from_millis(100), 100, 1.0);
         assert_eq!(t, Tempo::Doganianie);
     }
 
@@ -1121,9 +1036,9 @@ mod tests {
     /// i może wyjść zerowy — zabezpiecza istniejące `.max(0.5)`
     #[test]
     fn p6_orig_secs_zero_nie_dzieli_przez_zero() {
-        let t = pick_tempo(Duration::from_millis(100), 1, 0.0, false);
+        let t = pick_tempo(Duration::from_millis(100), 1, 0.0);
         assert_eq!(t, Tempo::Nominalne);
-        let t = pick_tempo(Duration::from_millis(100), 100, 0.0, false);
+        let t = pick_tempo(Duration::from_millis(100), 100, 0.0);
         assert_eq!(t, Tempo::Doganianie);
     }
 }
