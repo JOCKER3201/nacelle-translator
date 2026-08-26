@@ -291,8 +291,10 @@ impl TranslateGate {
     }
 
     /// [RT] czy wpychać mono do `cap_prod` (wejście segmentera/VAD).
-    /// `false` = tor AI nie dostaje ani jednej próbki, więc whisper nigdy
-    /// nie rusza i GPU stoi.
+    /// `false` = tor AI nie dostaje ani jednej próbki. Zdanie „GPU stoi" jest
+    /// prawdziwe dopiero dzięki temu, że `cmd_run` przy zamkniętej bramce
+    /// w ogóle nie woła `pipeline::spawn` — sama bramka w RT odcina tylko
+    /// dopływ próbek i model siedziałby w VRAM mimo niej.
     #[inline]
     pub fn feeds_ai(self) -> bool {
         self.on
@@ -312,9 +314,10 @@ impl TranslateGate {
             "tłumaczenie WŁĄCZONE: dźwięk przechodzący przez węzeł idzie do VAD/whisper \
              i może zostać przeczytany przez lektora (oryginał jest wtedy przyciszany)"
         } else {
-            "tłumaczenie WYŁĄCZONE ([audio].translate = false): węzeł jest czystą przelotką, \
-             tor AI nie dostaje ani jednej próbki, GPU stoi — włącz kluczem \
-             [audio].translate = true w nacelle-translator.toml"
+            "tłumaczenie WYŁĄCZONE ([audio].translate = false): węzeł jest czystą przelotką — \
+             tor AI nie jest budowany (whisper nie ładuje się do VRAM, piper nie startuje, \
+             silnik tłumaczenia nie jest potrzebny) i nie dostaje ani jednej próbki. \
+             Włącz kluczem [audio].translate = true w nacelle-translator.toml"
         }
     }
 }

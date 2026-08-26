@@ -20,7 +20,9 @@
 # CAŁY system o ~14 dB przy każdej jego wypowiedzi, także wtedy gdy tłumaczy
 # zupełnie inną aplikację. Włącz świadomie.
 #
-# Przy `false` tor AI nie dostaje ani jednej próbki, więc GPU stoi.
+# Przy `false` tor AI w ogóle NIE JEST BUDOWANY: whisper nie ładuje wag do
+# VRAM, piper się nie uruchamia, silnik tłumaczenia nie jest potrzebny.
+# W tym trybie program działa bez pobranego modelu i bez klucza API.
 translate = false
 
 # WYCOFANE. Ten klucz nie robi już NIC i jest przyjmowany wyłącznie po to,

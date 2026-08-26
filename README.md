@@ -8,8 +8,11 @@ wyjściowe wybierasz w KDE tak jak zawsze, a translator wpina się w ten tor
 sam i podąża za każdą zmianą urządzenia — bez restartu, bez ustawiania go
 jako wyjścia, bez jednego kliknięcia więcej. Technicznie robi to jako
 *inteligentny filtr* WirePlumbera (`filter.smart`), dokładnie tym samym
-mechanizmem co EasyEffects. W aplecie głośności **nie zobaczysz** żadnego
-nowego urządzenia i tak ma być.
+mechanizmem co EasyEffects. W aplecie głośności Plazmy **nie zobaczysz**
+żadnego nowego urządzenia i tak ma być — chowa go `node.virtual` razem
+z `filterVirtualDevices` w plasma-pa. W `pavucontrol` i w Ustawieniach GNOME
+węzeł jest widoczny: **nie wybieraj go** jako wyjścia, patrz „Urządzenie
+wyjściowe" niżej.
 
 Dźwięk przechodzący przez przelotkę jest — o ile włączysz tłumaczenie —
 segmentowany, transkrybowany, tłumaczony na polski i czytany głosem lektora,
@@ -41,8 +44,10 @@ aplikacje ──▶ [Nacelle Translator (PL)]  (smart filter, media.class=Audio/
      przepina bez restartu)
 ```
 
-Gałąź AI (od `rubato` w dół) rusza wyłącznie przy `[audio].translate = true`;
-przy `false` przez węzeł idzie sam passthrough.
+Gałąź AI (od `rubato` w dół) **w ogóle nie powstaje** przy
+`[audio].translate = false`: program nie ładuje modelu whispera, nie
+uruchamia pipera i nie łączy się z silnikiem tłumaczenia — przez węzeł idzie
+sam passthrough. Zależności z sekcji „Wymagania" są wtedy niepotrzebne.
 
 - **STT:** [whisper.cpp] przez `whisper-rs` (backend CUDA — feature `cuda`,
   model wielojęzyczny, autodetekcja języka źródłowego). Wymaga CUDA Toolkit
@@ -76,6 +81,12 @@ więc obraz się nie rozjeżdża — spóźnia się tylko głos lektora.
 
 ## Wymagania
 
+- **WirePlumber >= 0.5** jako menedżer sesji PipeWire. To NIE jest szczegół:
+  cały model działania stoi na jego politykach Lua — `filter.smart` (dodany
+  w serii 0.5) jest jedyną rzeczą, która wpina translator w tor dźwięku.
+  Z `pipewire-media-session` albo bez menedżera sesji węzeł powstanie, ale
+  nikt go z niczym nie zlinkuje i translator będzie niemy. Sprawdzisz przez
+  `wireplumber --version`.
 - **PipeWire** (daemon) + nagłówki `libpipewire-0.3`, **cmake**, **clang /
   libclang**, **Rust**. Na typowej dystrybucji instalujesz je z pakietów:
   - Fedora: `pipewire-devel clang-devel cmake` (+ `rustup`),
@@ -200,8 +211,9 @@ Nie wybieraj go jako urządzenia wyjściowego — patrz „Urządzenie wyjściow
 niżej.
 
 Samo tłumaczenie jest domyślnie **wyłączone** (przelotka przepuszcza dźwięk
-bez zmian). Włącza je `translate = true` w sekcji `[audio]` — patrz
-„Tłumaczenie" niżej.
+bez zmian) — i w tym trybie nie potrzebujesz ani modelu whispera, ani pipera,
+ani klucza API: tor AI się wtedy nie buduje. Włącza je `translate = true`
+w sekcji `[audio]` — patrz „Tłumaczenie" niżej.
 
 Konfiguracja: skopiuj `nacelle-translator.toml.example` do `nacelle-translator.toml` (albo
 uruchamiaj bez pliku — obowiązują te same wartości domyślne). Tryb testowy
@@ -262,15 +274,19 @@ Konsekwencje, o których warto wiedzieć:
   słuchawek/głośników w aplecie nie kończy translatora i nie wymaga
   restartu; w logu zobaczysz `INFO domyślne wyjście dźwięku zmieniono na …
   — przelotka podąża za tym wyborem sama`.
-- **Aplet głośności KDE ukrywa węzeł translatora** (`node.virtual = true`
+- **Aplet głośności Plazmy ukrywa węzeł translatora** (`node.virtual = true`
   + `filterVirtualDevices` w plasma-pa) — i to jest zamierzone. Przelotka nie
-  jest urządzeniem do wybrania.
-- **Jeśli mimo to ustawisz translator jako domyślne wyjście, ucichnie.**
-  Jego własny strumień odtwarzania trafiłby wtedy z powrotem na niego samego,
-  a WirePlumber słusznie odmawia takiego linkowania. Program tego **nie
-  naprawia sam** — nie nadpisuje ustawień dźwięku użytkownika — tylko krzyczy
-  w logu (`ERROR domyślnym wyjściem dźwięku jest NASZ własny węzeł …`)
-  i podaje nazwę urządzenia do wybrania. Wykrywa to też `check`.
+  jest urządzeniem do wybrania. Poza Plazmą (pavucontrol, Ustawienia GNOME,
+  dowolny klient pipewire-pulse) węzeł **jest widoczny** — nie wybieraj go.
+- **Jeśli mimo to ustawisz translator jako domyślne wyjście, dźwięk dalej
+  gra — ale ustawienie jest mylące.** Własny strumień odtwarzania nie może
+  trafić z powrotem na ten sam węzeł (WirePlumber odmawia linkowania w tej
+  samej `node.link-group`), więc wybór celu spada o poziom niżej, do
+  `find-best-target`, a ten pomija inteligentne filtry i dopina nas do
+  najlepszego sprzętowego wyjścia. Program tego stanu **nie naprawia sam** —
+  nie nadpisuje ustawień dźwięku użytkownika — tylko ostrzega w logu
+  (`WARN … domyślnym wyjściem dźwięku jest NASZ własny węzeł …`) i podaje
+  nazwę urządzenia do wybrania. `check` pokazuje to jako UWAGA, nie błąd.
 - Klucz `[audio].output_device` jest **wycofany** i nic nie robi. Zostaje
   przyjmowany, żeby stare pliki konfiguracyjne dalej się wczytywały; program
   raz ostrzega w logu i prosi o usunięcie linii.
@@ -285,8 +301,11 @@ przez AI musi być świadomym wyborem, a nie zachowaniem domyślnym:
 translate = true    # domyślnie false
 ```
 
-- `false` (domyślnie) — węzeł jest czystą przelotką. Dźwięk przechodzi
-  bez zmian, tor AI nie dostaje ani jednej próbki, GPU stoi.
+- `false` (domyślnie) — węzeł jest czystą przelotką. Dźwięk przechodzi bez
+  zmian, a tor AI **w ogóle się nie buduje**: whisper nie ładuje wag do VRAM,
+  piper się nie uruchamia, silnik tłumaczenia nie jest potrzebny. W tym
+  trybie `git clone` + `./build.sh` wystarczy do uruchomienia — bez modelu,
+  bez pipera, bez klucza API.
 - `true` — do VAD trafia wszystko, co przez przelotkę leci: gra,
   powiadomienie, muzyka. Whisper miele to na GPU, lektor odzywa się w środku
   rozgrywki, a ducking ścisza **cały** system o ~14 dB przy każdej jego
@@ -306,15 +325,21 @@ sinka, chronią przed tym:
 - **pomijanie inteligentnych filtrów jako celów** — WirePlumber nie wskaże
   jednego smart-filtra jako celu drugiego, więc nie wpiszemy się w siebie ani
   w EasyEffects „na krzyż";
-- **wykrycie i głośny komunikat** w jedynym przypadku, którego nie da się
-  zablokować od strony programu: gdy użytkownik ustawi translator jako
-  domyślne wyjście (opis wyżej).
+- **wykrycie i komunikat ostrzegawczy** w jedynym przypadku, którego nie da
+  się zablokować od strony programu: gdy użytkownik ustawi translator jako
+  domyślne wyjście (opis wyżej). Sprawdzane są OBA klucze metadanych —
+  `default.audio.sink` (ten, po który WirePlumber sięga przy wyborze celu)
+  i `default.configured.audio.sink` (zapamiętany wybór) — bo potrafią
+  wskazywać co innego.
 
 Czego tu **celowo nie ma**, a bywało wcześniej: `target.object`
 i `node.dont-fallback` (przypinały do jednego sprzętu i kazały WirePlumberowi
 niszczyć nasz węzeł) oraz `DONT_RECONNECT` (po pierwszym zlinkowaniu filtr
 nigdy nie przeniósłby się na nowe wyjście — wprost sprzecznie z modelem
-przelotki).
+przelotki). Żeby to usunięcie nie wróciło tylnymi drzwiami, oba węzły mają
+`state.restore-target = false` i `state.restore-props = false`: bez nich
+WirePlumber przywracałby z pliku stanu zapamiętany cel (czyli z powrotem
+`target.object`) i zapamiętane wyciszenie — trwale, po każdym restarcie.
 
 ## Diagnostyka w logu
 
@@ -325,9 +350,11 @@ Domyślny poziom to `info`; `-v` podnosi do `debug`. Co warto rozpoznać:
 - `INFO domyślne wyjście dźwięku zmieniono na ... — przelotka podąża za tym
   wyborem sama` — przełączyłeś urządzenie w KDE i wszystko jest w porządku;
   demon żyje dalej, restart nie jest potrzebny.
-- `ERROR domyślnym wyjściem dźwięku jest NASZ własny węzeł ...` — ustawiłeś
-  translator jako wyjście dźwięku. Wybierz swój prawdziwy sprzęt (komunikat
-  podaje jego nazwę); do tego czasu translator jest niemy.
+- `WARN aktywnym domyślnym wyjściem dźwięku ... jest NASZ własny węzeł ...` —
+  translator jest ustawiony jako wyjście dźwięku. Dźwięk gra dalej
+  (WirePlumber dopina nasz strumień do sprzętu przez `find-best-target`), ale
+  ustawienie jest mylące i potrafi znaczyć, że zniknęło Twoje urządzenie.
+  Wybierz swój prawdziwy sprzęt — komunikat podaje jego nazwę.
 - `WARN <strumień>: błąd sesyjny od serwera ...` — rutynowy komunikat
   WirePlumbera (zwykle „no target node available"), typowy w trakcie
   przepinania urządzenia; program pracuje dalej, komunikat jest dławiony

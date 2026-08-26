@@ -134,7 +134,31 @@ fn cmd_run(config_path: &PathBuf, experimental: &experimental::Selection) -> Res
     let prime = vec![0.0f32; 4096 * pw::CHANNELS];
     let _ = pass_prod.push_slice(&prime);
 
-    let health_rx = pipeline::spawn(cfg.clone(), cap_cons, tts_prod)?;
+    // BRAMKA MUSI ZADZIAŁAĆ TUTAJ, nie dopiero w callbackach RT. `pipeline::
+    // spawn` ładuje wagi whispera do VRAM, buduje tłumacza (przy silniku
+    // `gemini`/`claude` czyta klucz API i BAILUJE, gdy go nie ma; przy
+    // `ollama` robi pełną rozgrzewkową inferencję) i odpala dwa procesy
+    // pipera. Wołane bezwarunkowo sprawiało, że domyślna konfiguracja
+    // (`translate = false`) NIE WSTAWAŁA na świeżym klonie: `?` leciało do
+    // `main` i kończyło proces kodem 1, zanim w ogóle powstał węzeł
+    // PipeWire. Czyli tryb reklamowany jako „czysta przelotka, GPU stoi"
+    // wymagał modelu za 488 MB, binarki pipera i klucza API.
+    //
+    // `chan::never()` ma dokładnie typ `Receiver<String>` i nigdy nic nie
+    // przysyła ani się nie rozłącza, więc wątek-dozorca w `run_graph`
+    // (`health_rx.recv()`) po prostu blokuje się do końca życia procesu —
+    // a nie widzi rozłączonego kanału i nie melduje fałszywej śmierci toru.
+    // `cap_cons` i `tts_prod` są wtedy porzucane: przy zamkniętej bramce
+    // nikt do tych ringów nie pisze ani z nich nie czyta.
+    let health_rx = if cfg.audio.translate {
+        pipeline::spawn(cfg.clone(), cap_cons, tts_prod)?
+    } else {
+        log::info!(
+            "tor AI NIE JEST budowany ([audio].translate = false): whisper nie dotyka GPU, \
+             piper się nie uruchamia, silnik tłumaczenia nie jest potrzebny"
+        );
+        crossbeam_channel::never::<String>()
+    };
 
     pw::run_graph(
         pw::RtRings {
@@ -174,12 +198,28 @@ fn cmd_devices() -> Result<()> {
     Ok(())
 }
 
-fn check_item(failures: &mut usize, cond: bool, msg_ok: String, msg_err: String) {
-    if cond {
-        println!("  OK    {msg_ok}");
-    } else {
-        println!("  BŁĄD  {msg_err}");
-        *failures += 1;
+/// Waga braku zależności toru AI zależy od bramki.
+///
+/// Przy `[audio].translate = false` tor AI w ogóle nie powstaje (cmd_run
+/// pomija `pipeline::spawn`), więc brak modelu whispera, pipera czy klucza API
+/// NIE przeszkadza w uruchomieniu przelotki. Zgłaszanie tego jako BŁĄD dawało
+/// kod wyjścia 1 dla konfiguracji, którą `check` dwie linie wyżej sam nazywał
+/// poprawną. Wypisujemy więc UWAGA i nie ruszamy licznika — informacja
+/// zostaje, werdykt się zmienia.
+struct AiSeverity {
+    fatal: bool,
+}
+
+impl AiSeverity {
+    fn item(&self, failures: &mut usize, cond: bool, msg_ok: String, msg_err: String) {
+        if cond {
+            println!("  OK    {msg_ok}");
+        } else if self.fatal {
+            println!("  BŁĄD  {msg_err}");
+            *failures += 1;
+        } else {
+            println!("  UWAGA {msg_err}\n        (tłumaczenie wyłączone, więc to nie blokuje startu — przelotka ruszy bez tego)");
+        }
     }
 }
 
@@ -222,18 +262,20 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
     // wyświetlić same OK komuś, kto potem nie usłyszy ani słowa lektora
     // (model, piper i klucz API są sprawne; po prostu nic ich nie woła).
     // To nie jest BŁĄD: przelotka bez tłumaczenia jest poprawnym trybem.
+    let ai = AiSeverity { fatal: cfg.audio.translate };
     if cfg.audio.translate {
         println!("  OK    tłumaczenie WŁĄCZONE ([audio].translate = true)");
     } else {
         println!(
-            "  OK    tłumaczenie WYŁĄCZONE (domyślnie) — węzeł jest czystą przelotką, tor AI \
-             nie dostaje próbek.\n        Włącz wpisem `translate = true` w sekcji [audio]."
+            "  OK    tłumaczenie WYŁĄCZONE (domyślnie) — węzeł jest czystą przelotką: tor AI \
+             w ogóle się nie buduje, więc model whispera, piper i silnik tłumaczenia nie są \
+             potrzebne.\n        Włącz wpisem `translate = true` w sekcji [audio]."
         );
     }
 
     // model whisper
     let model = cfg.stt_model();
-    check_item(
+    ai.item(
         &mut failures,
         model.exists(),
         format!("model whisper: {}", model.display()),
@@ -244,7 +286,7 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
         ),
     );
     let name = model.file_name().unwrap_or_default().to_string_lossy().to_string();
-    check_item(
+    ai.item(
         &mut failures,
         // ".en." łapie ggml-base.en.bin; ".en-" łapie kwantyzowane warianty
         // (ggml-small.en-q5_1.bin) — bez tego drugiego warunku przechodziły
@@ -260,13 +302,13 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
     // piper
     let piper_bin = cfg.piper_bin();
     let voice = cfg.piper_voice();
-    check_item(
+    ai.item(
         &mut failures,
         piper_bin.exists(),
         format!("piper: {}", piper_bin.display()),
         format!("brak binarki pipera: {}", piper_bin.display()),
     );
-    check_item(
+    ai.item(
         &mut failures,
         voice.exists(),
         format!("głos: {}", voice.display()),
@@ -274,12 +316,9 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
     );
     match tts::read_voice_sample_rate(&voice) {
         Ok(rate) => println!("  OK    config głosu: {rate} Hz"),
-        Err(e) => {
-            println!("  BŁĄD  config głosu: {e:#}");
-            failures += 1;
-        }
+        Err(e) => ai.item(&mut failures, false, String::new(), format!("config głosu: {e:#}")),
     }
-    check_item(
+    ai.item(
         &mut failures,
         std::fs::create_dir_all(&cfg.tts.work_dir).is_ok(),
         format!("katalog roboczy TTS: {}", cfg.tts.work_dir),
@@ -290,7 +329,7 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
     // akceptuje make_translator, inaczej check przepuszcza literówkę
     // (np. "claud"), a `run` pada dopiero przy starcie pipeline'u
     match cfg.translate.engine.as_str() {
-        "gemini" => check_item(
+        "gemini" => ai.item(
             &mut failures,
             std::env::var("GEMINI_API_KEY")
                 .map(|v| !v.trim().is_empty())
@@ -303,19 +342,13 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
                 "  OK    Ollama: {} ma model \"{}\"",
                 cfg.translate.ollama_host, cfg.translate.ollama_model
             ),
-            Err(e) => {
-                println!("  BŁĄD  {e:#}");
-                failures += 1;
-            }
+            Err(e) => ai.item(&mut failures, false, String::new(), format!("{e:#}")),
         },
         "llamacpp" => match translate::llamacpp_check(&cfg.translate.llamacpp_host) {
             Ok(()) => println!("  OK    llama-server: {} odpowiada", cfg.translate.llamacpp_host),
-            Err(e) => {
-                println!("  BŁĄD  {e:#}");
-                failures += 1;
-            }
+            Err(e) => ai.item(&mut failures, false, String::new(), format!("{e:#}")),
         },
-        "claude" => check_item(
+        "claude" => ai.item(
             &mut failures,
             std::env::var("ANTHROPIC_API_KEY")
                 .map(|v| !v.trim().is_empty())
@@ -390,4 +423,34 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
     }
     println!("\nwszystko gotowe — uruchom: nacelle-translator run");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn g1_brak_zaleznosci_ai_nie_wywala_check_gdy_bramka_zamknieta() {
+        // Regresja, którą wypuściła poprzednia wersja: `check` przy
+        // `translate = false` reklamował „czystą przelotkę", a dwie linie
+        // niżej liczył brak modelu whispera i klucza API jako BŁĄD i kończył
+        // kodem 1. Skoro tor AI się wtedy nie buduje (cmd_run), brak jego
+        // zależności nie może być powodem do niezerowego kodu wyjścia.
+        let mut f = 0usize;
+        AiSeverity { fatal: false }.item(&mut f, false, String::new(), "brak modelu".into());
+        assert_eq!(f, 0, "zamknięta bramka nie może podbijać licznika błędów");
+    }
+
+    #[test]
+    fn g2_brak_zaleznosci_ai_dalej_jest_bledem_gdy_bramka_otwarta() {
+        // Druga strona tego samego niezmiennika: przy WŁĄCZONYM tłumaczeniu
+        // brak modelu to nadal twardy błąd — inaczej `check` przepuszczałby
+        // konfigurację, na której `run` padnie przy starcie pipeline'u.
+        let mut f = 0usize;
+        AiSeverity { fatal: true }.item(&mut f, false, String::new(), "brak modelu".into());
+        assert_eq!(f, 1);
+        // spełniony warunek nigdy nie podbija licznika, niezależnie od wagi
+        AiSeverity { fatal: true }.item(&mut f, true, "jest".into(), String::new());
+        assert_eq!(f, 1);
+    }
 }
