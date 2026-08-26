@@ -42,6 +42,89 @@ const FALLBACK_FRAMES: usize = 1024;
 /// jak często raportować w logu przepełnienia ringów RT
 const DROP_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Pomiar zaległości ringu passthrough — WYŁĄCZNIE diagnostyka, żadna
+/// wartość stąd nie wchodzi do decyzji w torze RT.
+///
+/// Po co: zaległość tego ringu jest dziś niezmiernikiem, którego NIKT nie
+/// mierzy. Teza "prime z main.rs zostaje w ringu na zawsze i daje stałe
+/// ~85 ms opóźnienia" jest wyprowadzona, nie zmierzona — a równie dobrze
+/// prime może wyparować w pierwszych kilku cyklach (sink nie produkuje, gdy
+/// nic do niego nie gra, a odtwarzanie drenuje co cykl). Regulator zaległości
+/// wolno dodać dopiero, gdy ta liczba jest znana, i z celem dobranym do niej,
+/// a nie do liczby z kartki.
+///
+/// Zapis z callbacku RT: trzy operacje atomowe `Relaxed` na cykl, bez blokad,
+/// bez alokacji, bez IO.
+#[derive(Default)]
+pub struct PassStats {
+    /// zaległość (w próbkach f32, stereo interleaved) z ostatniego cyklu
+    last: AtomicU64,
+    /// minimum od ostatniego raportu (u64::MAX = brak próbek)
+    min: AtomicU64,
+    /// maksimum od ostatniego raportu
+    max: AtomicU64,
+    /// `buf.requested()` z ostatniego cyklu — faktyczny kwant grafu
+    quantum: AtomicU64,
+    /// liczba cykli od ostatniego raportu
+    cycles: AtomicU64,
+}
+
+/// Migawka pomiaru zebrana przez wątek raportujący.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct PassSnapshot {
+    pub min_samples: u64,
+    pub max_samples: u64,
+    pub last_samples: u64,
+    pub quantum_frames: u64,
+    pub cycles: u64,
+}
+
+impl PassStats {
+    pub fn new() -> Self {
+        Self {
+            last: AtomicU64::new(0),
+            min: AtomicU64::new(u64::MAX),
+            max: AtomicU64::new(0),
+            quantum: AtomicU64::new(0),
+            cycles: AtomicU64::new(0),
+        }
+    }
+
+    /// [RT] wołane raz na cykl callbacku odtwarzania.
+    #[inline]
+    fn observe(&self, backlog_samples: u64, quantum_frames: u64) {
+        self.last.store(backlog_samples, Ordering::Relaxed);
+        self.min.fetch_min(backlog_samples, Ordering::Relaxed);
+        self.max.fetch_max(backlog_samples, Ordering::Relaxed);
+        self.quantum.store(quantum_frames, Ordering::Relaxed);
+        self.cycles.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Odczyt + zerowanie okna min/max. Zwraca `None`, gdy w oknie nie było
+    /// ani jednego cyklu (odtwarzanie stoi — to samo w sobie jest informacją,
+    /// ale nie ma czego uśredniać).
+    pub fn take(&self) -> Option<PassSnapshot> {
+        let cycles = self.cycles.swap(0, Ordering::Relaxed);
+        let min = self.min.swap(u64::MAX, Ordering::Relaxed);
+        let max = self.max.swap(0, Ordering::Relaxed);
+        if cycles == 0 || min == u64::MAX {
+            return None;
+        }
+        Some(PassSnapshot {
+            min_samples: min,
+            max_samples: max,
+            last_samples: self.last.load(Ordering::Relaxed),
+            quantum_frames: self.quantum.load(Ordering::Relaxed),
+            cycles,
+        })
+    }
+}
+
+/// Próbki ringu passthrough (stereo interleaved) → milisekundy odsłuchu.
+pub fn pass_samples_to_ms(samples: u64) -> f32 {
+    samples as f32 / CHANNELS as f32 / RATE as f32 * 1000.0
+}
+
 pub const SINK_NODE_NAME: &str = "nacelle-translator-sink";
 pub const OUT_NODE_NAME: &str = "nacelle-translator-out";
 /// prefiksy node.name wskazujące realny sprzęt — jedyne dopuszczalne przy
@@ -411,6 +494,8 @@ struct PlayState {
     duck: DuckParams,
     gain: f32,
     hold: u32,
+    /// tylko pomiar (Etap 1a) — nie wpływa na ani jedną próbkę
+    stats: Arc<PassStats>,
 }
 
 /// Współdzielony stan fatalny: ustawiany z callbacków `state_changed`/`error`
@@ -478,6 +563,7 @@ pub fn run_graph(
     let fatal: Fatal = Rc::new(RefCell::new(None));
     let cap_dropped = Arc::new(AtomicU64::new(0));
     let pass_dropped = Arc::new(AtomicU64::new(0));
+    let pass_stats = Arc::new(PassStats::new());
 
     // ---------- 1) wirtualny sink (Direction::Input) ----------
     let sink_stream = StreamBox::new(
@@ -607,6 +693,7 @@ pub fn run_graph(
         duck,
         gain: duck.pass_gain,
         hold: 0,
+        stats: pass_stats.clone(),
     };
 
     let _play_listener = play_stream
@@ -623,6 +710,10 @@ pub fn run_graph(
             // sekundy zbędnej latencji oraz wybuchowy, niekontrolowany
             // drenaż ringów pass/tts.
             let requested = buf.requested() as usize;
+            // [RT] pomiar zaległości PRZED drenażem ringu — po pętli niżej
+            // liczba traci sens. Trzy zapisy atomowe Relaxed, zero blokad.
+            st.stats
+                .observe(st.pass_cons.occupied_len() as u64, requested as u64);
             let datas = buf.datas_mut();
             let Some(d) = datas.first_mut() else { return };
             let mut total_frames = 0usize;
@@ -733,10 +824,11 @@ pub fn run_graph(
             }
         })?;
 
-    // ---------- okresowy raport przepełnień ringów RT ----------
+    // ---------- okresowy raport przepełnień + pomiar zaległości ----------
     {
         let cap_dropped = cap_dropped.clone();
         let pass_dropped = pass_dropped.clone();
+        let pass_stats = pass_stats.clone();
         std::thread::Builder::new()
             .name("rt-drop-reporter".into())
             .spawn(move || loop {
@@ -749,6 +841,27 @@ pub fn run_graph(
                          passthrough {pass} próbek — tor AI/odtwarzanie nie nadąża",
                         DROP_REPORT_INTERVAL.as_secs()
                     );
+                }
+                // Etap 1a: czysty pomiar. Ta linia ma dać TWARDĄ liczbę pod
+                // decyzję o regulatorze zaległości i o rozmiarze "prime"
+                // (main.rs) — dziś obie stoją na wyprowadzeniu, nie na pomiarze.
+                match pass_stats.take() {
+                    Some(s) => log::info!(
+                        "passthrough: zaległość min {:.1} / max {:.1} / ost. {:.1} ms \
+                         (kwant {} ramek = {:.1} ms, {} cykli/{}s)",
+                        pass_samples_to_ms(s.min_samples),
+                        pass_samples_to_ms(s.max_samples),
+                        pass_samples_to_ms(s.last_samples),
+                        s.quantum_frames,
+                        s.quantum_frames as f32 / RATE as f32 * 1000.0,
+                        s.cycles,
+                        DROP_REPORT_INTERVAL.as_secs()
+                    ),
+                    None => log::info!(
+                        "passthrough: ani jednego cyklu odtwarzania w ostatnich {}s \
+                         (węzeł uśpiony albo nieprzypięty do sprzętu)",
+                        DROP_REPORT_INTERVAL.as_secs()
+                    ),
                 }
             })?;
     }
@@ -766,4 +879,51 @@ pub fn run_graph(
         bail!(msg);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn w1_pomiar_bez_cykli_nie_raportuje() {
+        let s = PassStats::new();
+        assert_eq!(s.take(), None);
+    }
+
+    #[test]
+    fn w2_pomiar_zbiera_min_max_i_ostatni() {
+        let s = PassStats::new();
+        s.observe(4096, 1024);
+        s.observe(100, 1024);
+        s.observe(2048, 1024);
+        let snap = s.take().expect("były cykle");
+        assert_eq!(snap.min_samples, 100);
+        assert_eq!(snap.max_samples, 4096);
+        assert_eq!(snap.last_samples, 2048);
+        assert_eq!(snap.quantum_frames, 1024);
+        assert_eq!(snap.cycles, 3);
+    }
+
+    #[test]
+    fn w3_okno_min_max_zeruje_sie_po_odczycie() {
+        let s = PassStats::new();
+        s.observe(9999, 512);
+        s.take().unwrap();
+        // nowe okno nie może odziedziczyć maksimum z poprzedniego
+        s.observe(64, 512);
+        let snap = s.take().unwrap();
+        assert_eq!(snap.min_samples, 64);
+        assert_eq!(snap.max_samples, 64);
+        assert_eq!(snap.cycles, 1);
+    }
+
+    #[test]
+    fn w4_przeliczenie_probek_na_ms() {
+        // 4096 ramek stereo = 8192 próbek f32 @48 kHz = 85,333 ms
+        assert!((pass_samples_to_ms(4096 * CHANNELS as u64) - 85.333).abs() < 0.01);
+        // jeden kwant 1024 ramek = 21,333 ms
+        assert!((pass_samples_to_ms(1024 * CHANNELS as u64) - 21.333).abs() < 0.01);
+        assert_eq!(pass_samples_to_ms(0), 0.0);
+    }
 }
