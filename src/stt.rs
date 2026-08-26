@@ -42,27 +42,17 @@ impl Transcriber {
         })
     }
 
-    /// `samples`: f32 mono 16 kHz w [-1, 1].
-    pub fn transcribe(&mut self, samples: &[f32]) -> Result<Transcript> {
-        let padded;
-        let samples = if samples.len() < MIN_SAMPLES {
-            padded = {
-                let mut v = samples.to_vec();
-                v.resize(MIN_SAMPLES, 0.0);
-                v
-            };
-            &padded[..]
-        } else {
-            samples
-        };
-
+    /// Wspólna budowa FullParams — jedno źródło prawdy dla przebiegów
+    /// częściowych i finalnych: LocalAgreement mierzy zgodę dwóch przebiegów
+    /// na tym samym rosnącym audio, więc jakakolwiek różnica parametrów
+    /// zamieniłaby tę zgodę w pomiar różnicy ustawień.
+    /// ZAKAZ: żadnego set_initial_prompt (audio nadal zawiera scommitowane
+    /// słowa — prompt powieliłby je w hipotezie) i żadnych innych różnic
+    /// między rodzajami przebiegów.
+    fn make_params<'a>(&self, lang: &'a str) -> FullParams<'a, 'static> {
         let mut p = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         p.set_n_threads(self.threads);
-        if self.language == "auto" {
-            p.set_language(Some("auto")); // autodetekcja + transkrypcja
-        } else {
-            p.set_language(Some(&self.language));
-        }
+        p.set_language(Some(lang)); // "auto" = autodetekcja + transkrypcja
         p.set_detect_language(false); // true = sama detekcja, bez tekstu
         p.set_translate(false); // translate whisperem umie tylko na angielski
         p.set_no_context(true); // izolacja między wywołaniami full()
@@ -78,7 +68,50 @@ impl Transcriber {
         p.set_print_progress(false);
         p.set_print_realtime(false);
         p.set_print_timestamps(false);
+        p
+    }
 
+    /// `samples`: f32 mono 16 kHz w [-1, 1]. Przebieg FINALNY — zachowanie
+    /// bez zmian (delegacja do wspólnego `run`).
+    pub fn transcribe(&mut self, samples: &[f32]) -> Result<Transcript> {
+        self.run(samples, None, false).map(|(t, _)| t)
+    }
+
+    /// Przebieg CZĘŚCIOWY dla spekulacyjnego STT.
+    /// `locked_lang`: Some(kod) = język zamrożony lang_lockiem — whisper
+    /// dostaje go jawnie (zero flapowania detekcji między przebiegami);
+    /// None = jak konfiguracja ("auto" albo stały kod).
+    /// Drugi element wyniku: pewność detekcji języka — liczona tylko, gdy
+    /// język nie jest jeszcze ustalony (locked_lang == None i config ==
+    /// "auto"); służy bramce lang_lock (p >= LOCK_MIN_PROB).
+    pub fn transcribe_partial(
+        &mut self,
+        samples: &[f32],
+        locked_lang: Option<&str>,
+    ) -> Result<(Transcript, Option<f32>)> {
+        let want_prob = locked_lang.is_none() && self.language == "auto";
+        self.run(samples, locked_lang, want_prob)
+    }
+
+    fn run(
+        &mut self,
+        samples: &[f32],
+        lang_override: Option<&str>,
+        want_lang_prob: bool,
+    ) -> Result<(Transcript, Option<f32>)> {
+        let padded;
+        let samples = if samples.len() < MIN_SAMPLES {
+            padded = {
+                let mut v = samples.to_vec();
+                v.resize(MIN_SAMPLES, 0.0);
+                v
+            };
+            &padded[..]
+        } else {
+            samples
+        };
+
+        let p = self.make_params(lang_override.unwrap_or(&self.language));
         self.state.full(p, samples).context("whisper full()")?;
 
         let lang_id = self.state.full_lang_id_from_state();
@@ -107,12 +140,40 @@ impl Transcriber {
             -10.0
         };
 
-        Ok(Transcript {
-            text: text.trim().to_string(),
-            lang,
-            no_speech_prob: no_speech,
-            avg_logprob,
-        })
+        let lang_prob = if want_lang_prob {
+            // whisper_lang_auto_detect_with_state na mel policzonym przez
+            // full(): koszt = jeden dodatkowy przebieg enkodera, płacony
+            // tylko do chwili zamrożenia języka (zwykle 1-2 przebiegi na
+            // segment). Błąd detekcji nie zrywa przebiegu — sam tekst jest
+            // dobry, przepada tylko pewność.
+            match self.state.lang_detect(0, self.threads.max(1) as usize) {
+                Ok((id, probs)) => {
+                    // spójność: pewność bierzemy dla języka, który full()
+                    // faktycznie wybrał; rozjazd detekcji = brak pewności
+                    if whisper_rs::get_lang_str(id) == Some(lang.as_str()) {
+                        probs.get(id as usize).copied()
+                    } else {
+                        Some(0.0)
+                    }
+                }
+                Err(e) => {
+                    log::warn!("lang_detect: {e} — pomijam pewność");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok((
+            Transcript {
+                text: text.trim().to_string(),
+                lang,
+                no_speech_prob: no_speech,
+                avg_logprob,
+            },
+            lang_prob,
+        ))
     }
 }
 

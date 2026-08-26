@@ -48,6 +48,39 @@ struct SttJob {
     /// zaczyna się nakładką powielającą koniec tego; podstawa deduplikacji
     /// szwu w stt_thread
     forced: bool,
+    /// generacja segmentera (vad.rs) — spina final z migawkami spekulacyjnego
+    /// STT pobranymi z tego samego bufora audio
+    gen: u64,
+}
+
+/// Migawka OTWARTEGO segmentu do przebiegu częściowego whispera
+/// (spekulacyjne STT).
+struct PartialJob {
+    gen: u64,
+    /// chwila pobrania migawki — diagnostyka opóźnienia kanał+whisper
+    created: Instant,
+    audio: Vec<f32>,
+    speech_ms: u32,
+}
+
+/// Fragment = commit spekulacyjny (obietnica dostarczenia — zwolniony
+/// z bramek MAX_JOB_AGE: porzucenie po commicie byłoby ubytkiem treści,
+/// bo final ogona już nie powtórzy); FinalTail = ścieżka wsadowa / ogon
+/// finalu (bramki bez zmian).
+#[derive(Clone, Copy)]
+enum JobKind {
+    Fragment { gen: u64, idx: u32 },
+    FinalTail,
+}
+
+impl JobKind {
+    /// etykieta do logów: fragment "GEN.IDX", final — id segmentu
+    fn label(&self, id: u64) -> String {
+        match self {
+            JobKind::Fragment { gen, idx } => format!("{gen}.{idx}"),
+            JobKind::FinalTail => id.to_string(),
+        }
+    }
 }
 
 struct MtJob {
@@ -56,8 +89,10 @@ struct MtJob {
     text: String,
     lang: String,
     /// długość oryginalnego audio segmentu [s] — do wykrywania rozdętych
-    /// tłumaczeń w tts_thread
+    /// tłumaczeń w tts_thread; dla fragmentu szacunek: udział znakowy
+    /// fragmentu w hipotezie × sekundy bufora migawki
     orig_secs: f32,
+    kind: JobKind,
 }
 
 struct TtsJob {
@@ -65,6 +100,7 @@ struct TtsJob {
     created: Instant,
     text: String,
     orig_secs: f32,
+    kind: JobKind,
 }
 
 /// Wysyła nazwę wątku przy zakończeniu (Drop biegnie i po zwykłym return,
@@ -102,20 +138,25 @@ pub fn spawn(
         .build()?;
 
     let (seg_tx, seg_rx) = chan::bounded::<SttJob>(4);
+    // M6: kanał migawek bounded(1) + try_send — pełny kanał (STT zajęty)
+    // oznacza naturalne opuszczenie przebiegu, nie kolejkowanie zaległości
+    let (part_tx, part_rx) = chan::bounded::<PartialJob>(1);
     let (mt_tx, mt_rx) = chan::bounded::<MtJob>(1);
     let (tts_tx, tts_rx) = chan::bounded::<TtsJob>(1);
     let (health_tx, health_rx) = chan::bounded::<String>(4);
 
     let seg_cfg = cfg.vad.clone();
+    let seg_stt_cfg = cfg.stt.clone();
     let health = HealthGuard {
         name: "segmenter",
         tx: health_tx.clone(),
     };
     std::thread::Builder::new().name("segmenter".into()).spawn(move || {
         let _health = health;
-        segmenter_thread(cap_cons, vad, seg_cfg, seg_tx);
+        segmenter_thread(cap_cons, vad, seg_cfg, seg_stt_cfg, seg_tx, part_tx);
     })?;
 
+    let stt_cfg = cfg.stt.clone();
     let mt_cfg = cfg.translate.clone();
     let health = HealthGuard {
         name: "stt",
@@ -123,7 +164,7 @@ pub fn spawn(
     };
     std::thread::Builder::new().name("stt".into()).spawn(move || {
         let _health = health;
-        stt_thread(transcriber, mt_cfg, seg_rx, mt_tx);
+        stt_thread(transcriber, stt_cfg, mt_cfg, seg_rx, part_rx, mt_tx);
     })?;
 
     let health = HealthGuard {
@@ -156,8 +197,12 @@ fn segmenter_thread(
     mut cap_cons: HeapCons<f32>,
     mut vad: VoiceActivityDetector,
     vad_cfg: crate::config::VadCfg,
+    stt_cfg: crate::config::SttCfg,
     seg_tx: chan::Sender<SttJob>,
+    part_tx: chan::Sender<PartialJob>,
 ) {
+    /// długość chunka segmentera w ms — jednostka kadencji spekulacji
+    const CHUNK_MS: u32 = (VAD_CHUNK * 1000 / VAD_RATE) as u32; // 32 ms
     // chunk 256 zamiast 1024: batching wejścia 5 ms zamiast 21 ms — mniejsze
     // stałe opóźnienie frontu toru analizy przy pomijalnym koszcie CPU
     let mut resampler = match StreamResampler::new(crate::pw::RATE as usize, VAD_RATE, 256) {
@@ -172,6 +217,9 @@ fn segmenter_thread(
     let mut chunk = vec![0.0f32; VAD_CHUNK];
     let mut next_id: u64 = 1;
     let mut dropped: u64 = 0;
+    // kadencja spekulacji: akumulator ms czasu audio od ostatniej migawki
+    let mut cadence_acc: u32 = 0;
+    let mut part_dropped: u64 = 0;
 
     loop {
         // dokładnie tyle próbek 48 kHz, ile chce resampler
@@ -221,6 +269,42 @@ fn segmenter_thread(
             if was_idle && !segmenter.is_idle() {
                 log::info!("#{next_id} start mowy (p={p:.2})");
             }
+            // kadencja spekulacji w CZASIE AUDIO: chunk segmentera = 32 ms;
+            // zegar ścienny kłamie przy wstrzykiwanej ciszy i zaległościach
+            // resamplera
+            if closed.is_some() || segmenter.is_idle() {
+                cadence_acc = 0;
+            } else if stt_cfg.speculative {
+                cadence_acc += CHUNK_MS;
+                if cadence_acc >= stt_cfg.cadence_ms {
+                    cadence_acc = 0;
+                    if let Some((gen, audio, speech_ms)) = segmenter.open_snapshot() {
+                        // pad zerowy whispera (MIN_SAMPLES) daje na krótkim
+                        // buforze skorelowane halucynacje — poniżej
+                        // min_open_ms nie spekulujemy
+                        if audio.len() >= stt_cfg.min_open_ms as usize * VAD_RATE / 1000 {
+                            let pjob = PartialJob {
+                                gen,
+                                created: Instant::now(),
+                                audio,
+                                speech_ms,
+                            };
+                            if part_tx.try_send(pjob).is_err() {
+                                // kanał bounded(1) pełny = STT zajęty —
+                                // naturalne opuszczenie przebiegu (M6),
+                                // nie błąd
+                                part_dropped += 1;
+                                if part_dropped % 30 == 0 {
+                                    log::info!(
+                                        "spekulacja: opuszczono {part_dropped} migawek \
+                                         (STT nie nadąża za kadencją)"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(utt) = closed {
                 let id = next_id;
                 next_id += 1;
@@ -238,6 +322,7 @@ fn segmenter_thread(
                     audio: utt.audio,
                     coalesced: 1,
                     forced: utt.forced,
+                    gen: utt.gen,
                 };
                 if seg_tx.try_send(job).is_err() {
                     dropped += 1;
@@ -252,12 +337,25 @@ fn segmenter_thread(
 
 fn stt_thread(
     transcriber: Transcriber,
+    stt_cfg: crate::config::SttCfg,
     mt_cfg: crate::config::MtCfg,
     seg_rx: chan::Receiver<SttJob>,
+    part_rx: chan::Receiver<PartialJob>,
     mt_tx: chan::Sender<MtJob>,
 ) {
+    /// praca do wykonania w jednym obiegu pętli: final ma zawsze priorytet
+    enum Work {
+        Final(SttJob),
+        Partial(PartialJob),
+    }
     let mut transcriber = transcriber;
     let mut filter = HallucinationFilter::new();
+    let mut tracker = crate::agreement::SpeculativeTracker::new(stt_cfg.min_fragment_chars);
+    // licznik migawek odrzuconych jako przestarzała generacja (M1)
+    let mut stale_dropped: u64 = 0;
+    // generacja, dla której już zalogowano wstrzymanie fragmentów w języku
+    // docelowym — jeden log na segment zamiast spamu co kadencję
+    let mut skip_logged: Option<u64> = None;
     // ostatni ZAAKCEPTOWANY segment: (id, znormalizowane ostatnie słowo,
     // czy był ucięty w trakcie mowy i niesklejony) — do deduplikacji szwu
     let mut prev_seam: Option<(u64, String, bool)> = None;
@@ -265,12 +363,45 @@ fn stt_thread(
     // w następnym obiegu zamiast przepaść (try_recv już zdjął go z kanału)
     let mut pending: Option<SttJob> = None;
     loop {
-        let mut job = match pending.take() {
-            Some(j) => j,
-            None => match seg_rx.recv() {
-                Ok(j) => j,
+        let work = if let Some(j) = pending.take() {
+            Work::Final(j)
+        } else if !stt_cfg.speculative {
+            // ścieżka wsadowa 1:1 jak dotąd — zero zmian zachowania
+            match seg_rx.recv() {
+                Ok(j) => Work::Final(j),
                 Err(_) => break,
-            },
+            }
+        } else if let Ok(j) = seg_rx.try_recv() {
+            // M6: PRIORYTET finalów — final czekający w kolejce wygrywa
+            // z każdą migawką (select niżej nie gwarantuje kolejności)
+            Work::Final(j)
+        } else {
+            chan::select! {
+                recv(seg_rx) -> r => match r {
+                    Ok(j) => Work::Final(j),
+                    Err(_) => break,
+                },
+                recv(part_rx) -> r => match r {
+                    Ok(p) => Work::Partial(p),
+                    Err(_) => break,
+                },
+            }
+        };
+        let mut job = match work {
+            Work::Final(j) => j,
+            Work::Partial(p) => {
+                handle_partial(
+                    &mut transcriber,
+                    &mut tracker,
+                    &stt_cfg,
+                    &mt_cfg,
+                    &mt_tx,
+                    p,
+                    &mut stale_dropped,
+                    &mut skip_logged,
+                );
+                continue;
+            }
         };
         // sklejamy zaległe segmenty — jeden call whispera zamiast kolejki.
         // Limit sprawdzany PO doklejeniu: whisper z single_segment dekoduje
@@ -291,6 +422,9 @@ fn stt_thread(
                     job.created = next.created;
                     job.coalesced += next.coalesced;
                     job.forced = next.forced;
+                    // najnowsza generacja — spójne z min_gen = gen+1 po
+                    // finale, bo starsze generacje też są już domknięte
+                    job.gen = next.gen;
                 }
                 Err(_) => break,
             }
@@ -307,6 +441,11 @@ fn stt_thread(
                 age.as_secs_f32(),
                 MAX_JOB_AGE.as_secs()
             );
+            // final porzucony: tracker musi domknąć generację (scommitowany
+            // ogon przepada — strata liczona i logowana w trackerze)
+            if stt_cfg.speculative {
+                tracker.on_final_rejected(job.gen);
+            }
             continue;
         }
 
@@ -316,6 +455,9 @@ fn stt_thread(
             Ok(t) => t,
             Err(e) => {
                 log::error!("#{} whisper: {e:#}", job.id);
+                if stt_cfg.speculative {
+                    tracker.on_final_rejected(job.gen);
+                }
                 continue;
             }
         };
@@ -332,6 +474,11 @@ fn stt_thread(
                 t.no_speech_prob,
                 t.avg_logprob
             );
+            // M4: filtr działa na finalach jak dotąd (fragmenty go nie
+            // widzą); odrzucony final i tak domyka generację w trackerze
+            if stt_cfg.speculative {
+                tracker.on_final_rejected(job.gen);
+            }
             continue;
         }
         // Deduplikacja szwu: po cięciu wymuszonym nakładka 250 ms powiela
@@ -358,6 +505,9 @@ fn stt_thread(
         }
         if t.text.is_empty() {
             prev_seam = None;
+            if stt_cfg.speculative {
+                tracker.on_final_rejected(job.gen);
+            }
             continue;
         }
         prev_seam = Some((
@@ -381,6 +531,28 @@ fn stt_thread(
             t.avg_logprob
         );
 
+        // M3: ogon finalu — on_final MUSI pobiec przed decyzją skip niżej,
+        // bo reset generacji w trackerze jest potrzebny niezależnie od niej
+        let (text, orig_secs) = if stt_cfg.speculative {
+            let emit = tracker.on_final(job.gen, job.coalesced, &t.text);
+            if emit.reanchored {
+                log::warn!(
+                    "#{} re-kotwiczenie ogona finalu — emisja z duplikatem (łącznie: {})",
+                    job.id,
+                    tracker.reanchors
+                );
+            }
+            if emit.text.is_empty() {
+                log::info!("#{} final w całości pokryty fragmentami", job.id);
+                continue;
+            }
+            (emit.text, secs * emit.char_share)
+        } else {
+            (t.text, secs)
+        };
+
+        // M5: skip_target_lang decydowany WYŁĄCZNIE na finale (fragmenty
+        // w języku docelowym są wstrzymywane bez decyzji — handle_partial)
         if mt_cfg.skip_target_lang && t.lang == mt_cfg.target_lang_code {
             log::info!("#{} już w języku docelowym — pomijam", job.id);
             continue;
@@ -388,10 +560,128 @@ fn stt_thread(
         let _ = mt_tx.send(MtJob {
             id: job.id,
             created: job.created,
-            text: t.text,
+            text,
             lang: t.lang,
-            orig_secs: secs,
+            orig_secs,
+            kind: JobKind::FinalTail,
         });
+    }
+}
+
+/// Obsługa przebiegu częściowego (migawki otwartego segmentu) w wątku STT.
+/// Fragmenty NIE przechodzą przez HallucinationFilter (M4) — bramkują je
+/// wyłącznie: min długość (w trackerze) i lang_lock (M5).
+#[allow(clippy::too_many_arguments)]
+fn handle_partial(
+    transcriber: &mut Transcriber,
+    tracker: &mut crate::agreement::SpeculativeTracker,
+    stt_cfg: &crate::config::SttCfg,
+    mt_cfg: &crate::config::MtCfg,
+    mt_tx: &chan::Sender<MtJob>,
+    p: PartialJob,
+    stale_dropped: &mut u64,
+    skip_logged: &mut Option<u64>,
+) {
+    // M1: przebieg starszej generacji w całości do kosza — ZANIM zapłacimy
+    // za whispera (bufor, z którego pobrano migawkę, już nie istnieje)
+    if tracker.is_stale(p.gen) {
+        *stale_dropped += 1;
+        log::debug!(
+            "#{} migawka przestarzałej generacji odrzucona (łącznie: {stale_dropped})",
+            p.gen
+        );
+        return;
+    }
+    // język stały w konfiguracji = lock trywialny od pierwszego przebiegu
+    if stt_cfg.language != "auto" && tracker.locked_lang().is_none() {
+        tracker.lock_lang(&stt_cfg.language);
+    }
+    let locked = tracker.locked_lang().map(str::to_string);
+    let buf_secs = p.audio.len() as f32 / VAD_RATE as f32;
+    let t0 = Instant::now();
+    let (t, lang_prob) = match transcriber.transcribe_partial(&p.audio, locked.as_deref()) {
+        Ok(r) => r,
+        Err(e) => {
+            // to nie final — bez on_final_rejected; następny przebieg nadrobi
+            log::warn!("#{} whisper (przebieg częściowy): {e:#}", p.gen);
+            return;
+        }
+    };
+    log::debug!(
+        "#{} przebieg częściowy: {buf_secs:.1}s audio, stt {} ms, mowa {} ms, \
+         migawka sprzed {} ms: \"{}\"",
+        p.gen,
+        t0.elapsed().as_millis(),
+        p.speech_ms,
+        p.created.elapsed().as_millis(),
+        t.text
+    );
+
+    // M5: lang_lock dopiero przy pewnej detekcji (p >= LOCK_MIN_PROB)
+    // i buforze >= LOCK_MIN_MS — krótsze audio flapuje między językami
+    if tracker.locked_lang().is_none() {
+        let buf_ms = (p.audio.len() * 1000 / VAD_RATE) as u32;
+        if buf_ms >= crate::agreement::LOCK_MIN_MS
+            && lang_prob.unwrap_or(0.0) >= crate::agreement::LOCK_MIN_PROB
+            && t.lang != "und"
+        {
+            tracker.lock_lang(&t.lang);
+            log::info!(
+                "#{} lang_lock: {} (p={:.2}, bufor {buf_secs:.1}s)",
+                p.gen,
+                t.lang,
+                lang_prob.unwrap_or(0.0)
+            );
+        }
+    }
+
+    // przebiegi sprzed locka TEŻ karmią tracker (audio jest append-only,
+    // więc zgoda przebiegów pozostaje ważna) — bramkowana jest tylko emisja
+    let pending_frag = tracker.on_partial(p.gen, &t.text);
+
+    // M5: przed zamrożeniem języka NIE emitować
+    let Some(locked) = tracker.locked_lang().map(str::to_string) else {
+        return;
+    };
+    // M5: skip_target_lang decydowany WYŁĄCZNIE na finale — fragmenty
+    // w języku docelowym po prostu nie wychodzą (committed zostaje 0,
+    // więc final wyemituje całość i sam podejmie decyzję skip jak dziś)
+    if mt_cfg.skip_target_lang && locked == mt_cfg.target_lang_code {
+        if *skip_logged != Some(p.gen) {
+            *skip_logged = Some(p.gen);
+            log::info!(
+                "#{} przebiegi częściowe w języku docelowym — fragmenty wstrzymane \
+                 (decyzję podejmie final)",
+                p.gen
+            );
+        }
+        return;
+    }
+
+    if let Some(frag) = pending_frag {
+        let n_words = frag.text.split_whitespace().count();
+        let mjob = MtJob {
+            id: 0, // nieużywane dla fragmentów — logi biorą kind.label()
+            created: Instant::now(), // wiek fragmentu liczony OD CHWILI COMMITU
+            text: frag.text.clone(),
+            lang: locked,
+            orig_secs: buf_secs * frag.char_share,
+            kind: JobKind::Fragment {
+                gen: p.gen,
+                idx: frag.idx,
+            },
+        };
+        // send blokujący: Ok = fragment JEST w kanale — dopiero wtedy wolno
+        // przesunąć committed (M2); commit to obietnica dostarczenia
+        if mt_tx.send(mjob).is_ok() {
+            log::info!(
+                "#{}.{} fragment ({n_words} słów): \"{}\"",
+                p.gen,
+                frag.idx,
+                frag.text
+            );
+            tracker.commit(&frag);
+        }
     }
 }
 
@@ -400,13 +690,21 @@ fn translate_thread(
     mt_rx: chan::Receiver<MtJob>,
     tts_tx: chan::Sender<TtsJob>,
 ) {
+    // fragmenty spekulacyjne utracone na błędzie tłumaczenia — committed
+    // w trackerze JUŻ przesunięte, więc treść przepada bezpowrotnie (M2:
+    // strata zaakceptowana świadomie, ale liczona i logowana)
+    let mut lost_fragments: u64 = 0;
     while let Ok(job) = mt_rx.recv() {
+        let is_fragment = matches!(job.kind, JobKind::Fragment { .. });
         let age = job.created.elapsed();
-        if age > MAX_JOB_AGE {
+        // M2: commit to obietnica dostarczenia — fragmenty NIE podlegają
+        // budżetowi porzucania (porzucenie = ubytek treści, bo final ogona
+        // już nie powtórzy); ścieżka wsadowa (FinalTail) bez zmian
+        if !is_fragment && age > MAX_JOB_AGE {
             log::warn!(
                 "#{} pominięty przed tłumaczeniem — zaległość {:.1}s przekracza budżet {}s \
                  (oszczędzam wywołanie API)",
-                job.id,
+                job.kind.label(job.id),
                 age.as_secs_f32(),
                 MAX_JOB_AGE.as_secs()
             );
@@ -417,7 +715,7 @@ fn translate_thread(
             Ok(translated) => {
                 log::info!(
                     "#{} 🌐 \"{}\" (mt {} ms)",
-                    job.id,
+                    job.kind.label(job.id),
                     translated,
                     t0.elapsed().as_millis()
                 );
@@ -426,9 +724,24 @@ fn translate_thread(
                     created: job.created,
                     text: translated,
                     orig_secs: job.orig_secs,
+                    kind: job.kind,
                 });
             }
-            Err(e) => log::warn!("#{} tłumaczenie pominięte: {e:#}", job.id),
+            Err(e) => {
+                if is_fragment {
+                    lost_fragments += 1;
+                    log::warn!(
+                        "#{} fragment przepadł w tłumaczeniu (strat łącznie: \
+                         {lost_fragments}): {e:#}",
+                        job.kind.label(job.id)
+                    );
+                } else {
+                    log::warn!(
+                        "#{} tłumaczenie pominięte: {e:#}",
+                        job.kind.label(job.id)
+                    );
+                }
+            }
         }
     }
 }
@@ -446,26 +759,26 @@ fn synth_with_restart(
     cfg: &crate::config::TtsCfg,
     piper_bin: &PathBuf,
     piper_voice: &PathBuf,
-    id: u64,
+    label: &str,
     text: &str,
 ) -> Option<Vec<f32>> {
     match piper.synthesize(text) {
         Ok(c) => Some(c),
         Err(e) => {
-            log::error!("#{id} piper: {e:#} — próbuję zrestartować proces");
+            log::error!("#{label} piper: {e:#} — próbuję zrestartować proces");
             match PiperTts::spawn(cfg, piper_bin, piper_voice) {
                 Ok(fresh) => {
                     *piper = fresh;
                     match piper.synthesize(text) {
                         Ok(c) => Some(c),
                         Err(e2) => {
-                            log::error!("#{id} piper po restarcie nadal błąd: {e2:#} — pomijam");
+                            log::error!("#{label} piper po restarcie nadal błąd: {e2:#} — pomijam");
                             None
                         }
                     }
                 }
                 Err(spawn_err) => {
-                    log::error!("nie mogę zrestartować pipera: {spawn_err:#} — pomijam #{id}");
+                    log::error!("nie mogę zrestartować pipera: {spawn_err:#} — pomijam #{label}");
                     std::thread::sleep(Duration::from_secs(3));
                     None
                 }
@@ -495,11 +808,14 @@ fn tts_thread(
         };
 
     while let Ok(job) = tts_rx.recv() {
+        let label = job.kind.label(job.id);
         let age = job.created.elapsed();
-        if age > MAX_JOB_AGE {
+        // M2: fragmenty spekulacyjne zwolnione z budżetu porzucania — commit
+        // to obietnica dostarczenia; tryb doganiania niżej dalej działa
+        // (przyspiesza odczyt, niczego nie porzuca)
+        if !matches!(job.kind, JobKind::Fragment { .. }) && age > MAX_JOB_AGE {
             log::warn!(
-                "#{} pominięty przed syntezą — zaległość {:.1}s przekracza budżet {}s",
-                job.id,
+                "#{label} pominięty przed syntezą — zaległość {:.1}s przekracza budżet {}s",
                 age.as_secs_f32(),
                 MAX_JOB_AGE.as_secs()
             );
@@ -521,7 +837,7 @@ fn tts_thread(
             } else {
                 (&mut piper, &cfg)
             };
-            match synth_with_restart(active, active_cfg, &piper_bin, &piper_voice, job.id, &job.text)
+            match synth_with_restart(active, active_cfg, &piper_bin, &piper_voice, &label, &job.text)
             {
                 Some(c) => c,
                 None => continue,
@@ -530,7 +846,7 @@ fn tts_thread(
         let clip48 = match upsampler.resample(&clip) {
             Ok(c) => c,
             Err(e) => {
-                log::error!("#{} resampling TTS: {e:#}", job.id);
+                log::error!("#{label} resampling TTS: {e:#}");
                 continue;
             }
         };
@@ -539,8 +855,7 @@ fn tts_thread(
         // (wiek mały) czy w kolejce odtwarzania (wiek rośnie z segmentu
         // na segment)
         log::info!(
-            "#{} 🔊 {:.1}s mowy lektora (tts {} ms, wiek {:.1}s{})",
-            job.id,
+            "#{label} 🔊 {:.1}s mowy lektora (tts {} ms, wiek {:.1}s{})",
             clip48.len() as f32 / crate::pw::RATE as f32,
             t0.elapsed().as_millis(),
             job.created.elapsed().as_secs_f32(),

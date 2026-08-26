@@ -44,6 +44,18 @@ overlap_ms = 250         # nakładka przenoszona po wymuszonym cięciu
 model = "models/ggml-small.bin"  # model WIELOJĘZYCZNY (nie *.en!)
 language = "auto"                # albo kod źródłowy na sztywno, np. "en"
 threads = 8                      # rdzenie fizyczne; SMT często szkodzi ggml
+speculative = false              # spekulacyjne STT: whisper puszczany co cadence_ms CZASU AUDIO
+                                 # na rosnącym, OTWARTYM segmencie; stabilny prefiks dwóch zgodnych
+                                 # przebiegów (LocalAgreement-2) idzie do tłumaczenia od razu,
+                                 # final domyka tylko niewyemitowany ogon — niższe opóźnienie
+                                 # pierwszych słów kosztem dodatkowych przebiegów whispera (GPU)
+cadence_ms = 400                 # kadencja przebiegów częściowych [ms CZASU AUDIO — liczona
+                                 # chunkami segmentera po 32 ms, nie zegarem ściennym]
+min_open_ms = 1500               # poniżej tej długości otwartego bufora nie spekulujemy: pad
+                                 # zerowy whispera (~1,1 s) daje na krótkim audio skorelowane
+                                 # halucynacje, które wyglądałyby na "stabilne"
+min_fragment_chars = 12          # minimalna długość fragmentu w znakach (do interpunkcji
+                                 # frazowej); krótsze fragmenty czekają na kolejny przebieg
 
 [translate]
 # "gemini" (domyślny, API w chmurze) | "ollama" (lokalny model przez Ollamę
