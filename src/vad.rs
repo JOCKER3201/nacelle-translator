@@ -20,13 +20,30 @@ pub struct Utterance {
     /// segment ucięty w trakcie mowy (mowa trwa dalej)
     pub forced: bool,
     /// jak doszło do domknięcia — kluczowa dana diagnostyczna dla trudnego
-    /// materiału (film z muzyką): dominacja hard-max przy wysokim p_min
-    /// oznacza, że podkład trzyma p nad progami i VAD nie ma się o co zaczepić
+    /// materiału (film z muzyką): dominacja hard-max przy wysokim `p_dip`
+    /// oznacza, że podkład trzyma p nad progami i VAD nie ma się o co
+    /// zaczepić. UWAGA: rozstrzyga o tym `p_dip`, a NIE `p_min` — patrz niżej.
     pub reason: CloseReason,
-    /// najniższe p zaobserwowane w segmencie
+    /// najniższe p zaobserwowane w segmencie. Liczone od poprzedniego
+    /// domknięcia po KAŻDYM chunku, więc obejmuje też czas SPRZED okna
+    /// śledzenia dołków (a przy cięciu wymuszonym również chunki ogona
+    /// zarejestrowane już po punkcie cięcia). Dlatego niskie `p_min` NIE
+    /// dowodzi, że w oknie śledzenia był dołek nadający się do cięcia —
+    /// głębokie minima potrafią leżeć w całości przed oknem.
     pub p_min: f32,
-    /// średnie p w segmencie
+    /// średnie p w segmencie (ten sam zakres liczenia co `p_min`)
     pub p_mean: f32,
+    /// ile chunków objęła statystyka `p_min`/`p_mean`. Bez tego p̄ sugeruje
+    /// pokrycie całego bufora, a przy cięciu wymuszonym liczniki startują od
+    /// zera zaraz po cięciu, choć bufor ogona zawiera już nakładkę i ogon:
+    /// `p_n * 32 ms` mówi wprost, ile audio ta statystyka naprawdę opisuje.
+    pub p_n: u32,
+    /// p DOKŁADNIE w punkcie cięcia (dno dołka, w którym przecięliśmy bufor).
+    /// `None` dla domknięć nie-wymuszonych: pauza i mikropauza kończą segment
+    /// na jego końcu, a nie w wybranym dołku — nie ma tam "punktu cięcia"
+    /// w tym sensie. To jedyna liczba rozstrzygająca, czy inny
+    /// `dip_threshold` cokolwiek by zmienił przy cięciach hard-max.
+    pub p_dip: Option<f32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -35,9 +52,17 @@ pub enum CloseReason {
     Hangover,
     /// mikropauza po przekroczeniu soft_max_ms (soft_hangover_ms)
     SoftHangover,
-    /// cięcie w ustabilizowanym dołku p (dip_settle_ms + dip_threshold)
+    /// cięcie w ustabilizowanym dołku p: minimum okna zeszło poniżej
+    /// dip_threshold i utrzymało się przez dip_settle_ms
     SettledDip,
-    /// awaryjne twarde cięcie przy hard_max_ms — żaden dołek się nie trafił
+    /// twarde cięcie przy hard_max_ms. NIE znaczy "żaden dołek się nie
+    /// trafił" i NIE tnie w dowolnym miejscu: punkt cięcia jest DOKŁADNIE
+    /// ten sam co przy SettledDip — biegnące minimum p okna śledzenia
+    /// (wspólne `cut` w `maybe_force_cut`). Różni się wyłącznie powód
+    /// odpalenia: to minimum nie spełniło dip_threshold albo nie zdążyło
+    /// przetrwać dip_settle_ms, więc o chwili cięcia zdecydował limit
+    /// długości, a nie akustyka — dołek bywa wtedy płytki i wypada
+    /// wewnątrz frazy.
     HardMax,
 }
 
@@ -116,18 +141,22 @@ impl Segmenter {
         self.p_n += 1;
     }
 
-    /// (p_min, p_mean) bieżącego segmentu + reset liczników pod następny.
-    fn take_p_stats(&mut self) -> (f32, f32) {
+    /// (p_min, p_mean, p_n) bieżącego segmentu + reset liczników pod następny.
+    /// `p_n` wychodzi na zewnątrz, bo po cięciu wymuszonym liczniki startują
+    /// od zera, a bufor ogona już zawiera audio (nakładka + ogon) — bez tej
+    /// liczby p̄ ogona wygląda, jakby opisywało cały bufor.
+    fn take_p_stats(&mut self) -> (f32, f32, u32) {
         let mean = if self.p_n > 0 {
             (self.p_sum / self.p_n as f64) as f32
         } else {
             0.0
         };
         let min = if self.p_min_seg.is_finite() { self.p_min_seg } else { 0.0 };
+        let n = self.p_n;
         self.p_min_seg = f32::INFINITY;
         self.p_sum = 0.0;
         self.p_n = 0;
-        (min, mean)
+        (min, mean, n)
     }
 
     /// Czy segmenter nie ma otwartej wypowiedzi (bezpiecznie można przestać
@@ -214,7 +243,7 @@ impl Segmenter {
                     self.cfg.hangover_ms
                 };
                 if silence_ms >= hangover_needed {
-                    let (p_min, p_mean) = self.take_p_stats();
+                    let (p_min, p_mean, p_n) = self.take_p_stats();
                     // M1: KAŻDE domknięcie inkrementuje generację — także
                     // odrzucenie za-krótkiego segmentu niżej: migawki pobrane
                     // z odrzuconego bufora muszą stać się nieważne, inaczej
@@ -236,6 +265,10 @@ impl Segmenter {
                             },
                             p_min,
                             p_mean,
+                            p_n,
+                            // pauza/mikropauza tną na końcu bufora, nie
+                            // w wybranym dołku — punkt cięcia nie istnieje
+                            p_dip: None,
                         })
                     } else {
                         // za krótkie — niemal na pewno śmieć/halucynacja
@@ -286,13 +319,27 @@ impl Segmenter {
     /// i po whisperze ląduje śmieciowy segment złożony głównie z ciszy.
     fn maybe_force_cut(&mut self, hangover_silence: Option<u32>) -> Option<Utterance> {
         // Cięcie w "ustabilizowanym" dołku: jeśli po soft_max trafił się
-        // prawdziwy akustyczny dołek (p <= threshold_exit — oddech/zawieszenie
+        // prawdziwy akustyczny dołek (p <= dip_threshold — oddech/zawieszenie
         // za krótkie, żeby domknąć segment przez soft_hangover) i od tej
         // chwili minęło dip_settle_ms bez głębszego dołka — tnij w nim TERAZ.
         // Bez tego ciągła mowa bez pauz czekała zawsze pełne hard_max (~8 s),
         // zanim COKOLWIEK wyszło z segmentera, mimo że miejsce cięcia było
-        // znane dużo wcześniej. hard_max zostaje jako bezpiecznik na wypadek,
-        // gdy żaden dołek nie zejdzie poniżej threshold_exit.
+        // znane dużo wcześniej.
+        //
+        // UWAGA na progi: warunek dołka porównuje się z `dip_threshold`
+        // (luźniejszym), a NIE z `threshold_exit` — ten drugi rządzi tylko
+        // histerezą Speech/Hangover.
+        //
+        // Czym różni się hard_max od dołka: NIE tym, że "żaden dołek się nie
+        // trafił". `track_dip` zasiewa `dip` bezwarunkowo pierwszym chunkiem
+        // od `soft_max - dip_settle`, więc przy `seg_ms >= hard_max` dołek
+        // praktycznie zawsze istnieje — po prostu nie zszedł poniżej
+        // dip_threshold albo nie zdążył przeżyć dip_settle_ms. Obie ścieżki
+        // tną w TYM SAMYM punkcie (wspólne `cut` niżej = biegnące minimum p
+        // okna); hard_max zmienia wyłącznie to, że przestajemy czekać na
+        // spełnienie warunków dołka. Gałąź `unwrap_or(self.seg.len())` jest
+        // w praktyce martwa i zostaje tylko jako asekuracja, gdyby okno
+        // śledzenia kiedyś się przesunęło.
         let settled_dip = self.dip.is_some_and(|(_, p, at_ms)| {
             p <= self.cfg.dip_threshold
                 && self.seg_ms.saturating_sub(at_ms) >= self.cfg.dip_settle_ms
@@ -300,7 +347,14 @@ impl Segmenter {
         if self.seg_ms < self.cfg.hard_max_ms && !settled_dip {
             return None;
         }
-        let cut = self.dip.map(|(i, _, _)| i).unwrap_or(self.seg.len());
+        // p w punkcie cięcia przechwytujemy RAZEM z pozycją: niżej stoi
+        // `self.dip = None`, więc każdy odczyt po tamtej linii dawałby
+        // zawsze None (dokładnie ten artefakt, przez który logowane pmin
+        // było bezużyteczne dla diagnozy hard-maxa)
+        let (cut, p_dip) = self
+            .dip
+            .map(|(i, p, _)| (i, Some(p)))
+            .unwrap_or((self.seg.len(), None));
         let cut = cut.min(self.seg.len());
         let head: Vec<f32> = self.seg[..cut].to_vec();
         let tail: Vec<f32> = self.seg[cut..].to_vec();
@@ -320,9 +374,12 @@ impl Segmenter {
             None => State::Speech,
         };
 
-        // statystyki dotyczą całego dotychczasowego bufora (głowa+ogon) —
-        // dla diagnostyki wystarczające; ogon zaczyna liczyć od zera
-        let (p_min, p_mean) = self.take_p_stats();
+        // statystyki dotyczą wszystkich chunków od poprzedniego domknięcia
+        // (głowa + zarejestrowany dotąd ogon) — dla diagnostyki wystarczające;
+        // ogon zaczyna liczyć od zera, więc jego przyszłe p̄/pmin opiszą tylko
+        // audio zarejestrowane PO cięciu, mimo że bufor ma już nakładkę
+        // i ogon — stąd `p_n` w Utterance, żeby było widać pokrycie
+        let (p_min, p_mean, p_n) = self.take_p_stats();
         self.tail_of_forced_cut = true;
         // M1: cięcie wymuszone łamie założenie append-only bufora — nowy
         // bufor zaczyna się nakładką akustycznie powielającą słowa być może
@@ -342,6 +399,8 @@ impl Segmenter {
             },
             p_min,
             p_mean,
+            p_n,
+            p_dip,
         })
     }
 }
@@ -423,6 +482,66 @@ mod tests {
         assert_eq!(audio.len(), 2 * VAD_CHUNK);
         assert_eq!(audio[0], 8.0 * 0.001);
         assert_eq!(audio[VAD_CHUNK], 9.0 * 0.001);
+    }
+
+    // V2b: cięcie hard-max niesie p DOŁKA, w którym faktycznie przecięliśmy
+    // bufor — nie None i nie globalne minimum segmentu. Głęboki dołek (0.05)
+    // leży PRZED oknem śledzenia, więc p_min go widzi, a punkt cięcia nie:
+    // dokładnie ta różnica sprawiła, że logowane pmin nie mówiło nic
+    // o przyczynie cięć hard-max.
+    #[test]
+    fn v2b_hard_max_niesie_p_punktu_ciecia() {
+        let mut s = Segmenter::new(cfg());
+        // p po chunkach: dołek 0.05 poza oknem (i=4), dołek okna 0.75 (i=8)
+        let ps = [0.9, 0.9, 0.9, 0.9, 0.05, 0.9, 0.9, 0.9, 0.75, 0.8];
+        let mut forced = None;
+        for (i, p) in ps.iter().enumerate() {
+            let c = chunk(i as f32 * 0.001);
+            if let Some(u) = s.push_chunk(&c, *p) {
+                forced = Some(u);
+            }
+        }
+        let u = forced.expect("hard_max powinien wymusić cięcie");
+        assert!(u.forced);
+        assert_eq!(u.reason.label(), "hard-max");
+        // p w punkcie cięcia = minimum OKNA (0.75), nie minimum segmentu
+        assert_eq!(u.p_dip, Some(0.75));
+        assert_eq!(u.p_min, 0.05);
+        // statystyka objęła wszystkie 10 chunków (głowa 9 + ogon 1)
+        assert_eq!(u.p_n, 10);
+        // cięcie faktycznie w dołku okna: głowa = 9 chunków
+        assert_eq!(u.audio.len(), 9 * VAD_CHUNK);
+    }
+
+    // V2c: cięcie w ustabilizowanym dołku też niesie p punktu cięcia
+    #[test]
+    fn v2c_settled_dip_niesie_p_dolka() {
+        let mut vcfg = cfg();
+        vcfg.hard_max_ms = 3_200; // hard-max daleko — cięcie ma odpalić dołek
+        let mut s = Segmenter::new(vcfg);
+        let ps = [0.9, 0.9, 0.9, 0.9, 0.2, 0.9, 0.9, 0.9, 0.5, 0.9];
+        let mut forced = None;
+        for (i, p) in ps.iter().enumerate() {
+            let c = chunk(i as f32 * 0.001);
+            if let Some(u) = s.push_chunk(&c, *p) {
+                forced = Some(u);
+            }
+        }
+        let u = forced.expect("ustabilizowany dołek powinien wymusić cięcie");
+        assert_eq!(u.reason.label(), "dołek");
+        assert_eq!(u.p_dip, Some(0.5));
+        assert_eq!(u.p_min, 0.2);
+    }
+
+    // V2d: domknięcie pauzą nie ma punktu cięcia — p_dip jest None
+    #[test]
+    fn v2d_hangover_bez_punktu_ciecia() {
+        let mut s = Segmenter::new(cfg());
+        let u = speak_and_close(&mut s, 4).expect("segment domknięty");
+        assert!(!u.forced);
+        assert!(u.p_dip.is_none());
+        // 4 chunki mowy + 2 ciszy
+        assert_eq!(u.p_n, 6);
     }
 
     // V3: open_snapshot — None w Idle, rosnąca kopia w Speech

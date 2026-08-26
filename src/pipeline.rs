@@ -316,11 +316,25 @@ fn segmenter_thread(
                 let id = next_id;
                 next_id += 1;
                 let secs = utt.audio.len() as f32 / VAD_RATE as f32;
+                // p_cut = p w punkcie cięcia; "-" dla domknięć nie-wymuszonych,
+                // które nie mają punktu cięcia. To jedyna liczba mówiąca, jak
+                // głęboki był dołek, w którym faktycznie przecięliśmy bufor —
+                // pmin obejmuje CAŁY segment (także czas sprzed okna śledzenia
+                // dołków), więc nie odpowiada na to pytanie. p_n to liczba
+                // chunków objętych statystyką (32 ms każdy) — po cięciu
+                // wymuszonym liczniki startują od zera, więc p̄ nie opisuje
+                // całego bufora następnego segmentu.
+                let p_cut = match utt.p_dip {
+                    Some(p) => format!("{p:.2}"),
+                    None => "-".to_string(),
+                };
                 log::info!(
-                    "#{id} segment zamknięty: {secs:.1}s (powód: {}, p̄={:.2}, pmin={:.2}){}",
+                    "#{id} segment zamknięty: {secs:.1}s (powód: {}, p̄={:.2}, pmin={:.2}, \
+                     p_cut={p_cut}, p_n={}){}",
                     utt.reason.label(),
                     utt.p_mean,
                     utt.p_min,
+                    utt.p_n,
                     if utt.forced { " — mowa trwa dalej" } else { "" }
                 );
                 let job = SttJob {

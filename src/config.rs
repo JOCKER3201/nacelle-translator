@@ -69,7 +69,14 @@ pub struct VadCfg {
     /// (vad.rs), a `settled_dip` wymaga jeszcze `dip_settle_ms` bez głębszego
     /// dołka. Okno wyścigu "dołek zdąży przed twardym cięciem" to więc
     /// DOKŁADNIE ta różnica, i zejście poniżej niej zamienia cięcia w dołku
-    /// (dobra granica frazy) na cięcia twarde (w połowie słowa).
+    /// (dobra granica frazy) na cięcia twarde.
+    ///
+    /// Twarde cięcie NIE tnie "w połowie słowa" w sensie losowego miejsca:
+    /// punkt cięcia jest ten sam co przy dołku — biegnące minimum p okna
+    /// śledzenia. Różni się powód odpalenia: zamiast akustyki (p poniżej
+    /// dip_threshold utrzymane przez dip_settle_ms) decyduje limit czasu,
+    /// więc bierzemy minimum takie, jakie akurat jest — bywa płytkie
+    /// i wtedy wypada wewnątrz frazy zamiast na jej granicy.
     /// Zmierzony w audycie rozkład czekania na ustabilizowany dołek, liczony
     /// od soft_max: mediana 0.65 s, p90 1.33 s, p95 1.60 s, max 1.70 s —
     /// czyli 2.0 s to p95 + 0.4 s marginesu i daje obserwowane 6 % domknięć
