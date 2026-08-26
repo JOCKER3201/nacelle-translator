@@ -114,6 +114,9 @@ fn cmd_run(config_path: &PathBuf, experimental: &experimental::Selection) -> Res
     if let Some(w) = cfg.tuning_warning() {
         log::warn!("{w}");
     }
+    if let Some(w) = cfg.output_device_warning() {
+        log::warn!("{w}");
+    }
 
     // ringbuffery RT ↔ tor AI
     let (cap_prod, cap_cons) = HeapRb::<f32>::new(pw::RATE as usize * 4).split(); // mono, 4 s
@@ -131,10 +134,33 @@ fn cmd_run(config_path: &PathBuf, experimental: &experimental::Selection) -> Res
     let prime = vec![0.0f32; 4096 * pw::CHANNELS];
     let _ = pass_prod.push_slice(&prime);
 
-    let health_rx = pipeline::spawn(cfg.clone(), cap_cons, tts_prod)?;
+    // BRAMKA MUSI ZADZIAŁAĆ TUTAJ, nie dopiero w callbackach RT. `pipeline::
+    // spawn` ładuje wagi whispera do VRAM, buduje tłumacza (przy silniku
+    // `gemini`/`claude` czyta klucz API i BAILUJE, gdy go nie ma; przy
+    // `ollama` robi pełną rozgrzewkową inferencję) i odpala dwa procesy
+    // pipera. Wołane bezwarunkowo sprawiało, że domyślna konfiguracja
+    // (`translate = false`) NIE WSTAWAŁA na świeżym klonie: `?` leciało do
+    // `main` i kończyło proces kodem 1, zanim w ogóle powstał węzeł
+    // PipeWire. Czyli tryb reklamowany jako „czysta przelotka, GPU stoi"
+    // wymagał modelu za 488 MB, binarki pipera i klucza API.
+    //
+    // `chan::never()` ma dokładnie typ `Receiver<String>` i nigdy nic nie
+    // przysyła ani się nie rozłącza, więc wątek-dozorca w `run_graph`
+    // (`health_rx.recv()`) po prostu blokuje się do końca życia procesu —
+    // a nie widzi rozłączonego kanału i nie melduje fałszywej śmierci toru.
+    // `cap_cons` i `tts_prod` są wtedy porzucane: przy zamkniętej bramce
+    // nikt do tych ringów nie pisze ani z nich nie czyta.
+    let health_rx = if cfg.audio.translate {
+        pipeline::spawn(cfg.clone(), cap_cons, tts_prod)?
+    } else {
+        log::info!(
+            "tor AI NIE JEST budowany ([audio].translate = false): whisper nie dotyka GPU, \
+             piper się nie uruchamia, silnik tłumaczenia nie jest potrzebny"
+        );
+        crossbeam_channel::never::<String>()
+    };
 
     pw::run_graph(
-        cfg.audio.output_device.as_deref(),
         pw::RtRings {
             cap_prod,
             pass_prod,
@@ -142,12 +168,13 @@ fn cmd_run(config_path: &PathBuf, experimental: &experimental::Selection) -> Res
             tts_cons,
         },
         pw::DuckParams::from_cfg(&cfg.audio),
+        pw::TranslateGate::new(cfg.audio.translate),
         health_rx,
     )
 }
 
 fn cmd_devices() -> Result<()> {
-    let (sinks, default) = pw::discover_sinks()?;
+    let pw::GraphSnapshot { sinks, defaults: default, .. } = pw::discover_sinks()?;
     if sinks.is_empty() {
         println!("brak węzłów Audio/Sink");
         return Ok(());
@@ -159,7 +186,10 @@ fn cmd_devices() -> Result<()> {
         } else {
             "-"
         };
-        let is_default = if default.as_deref() == Some(s.name.as_str()) { "*" } else { "" };
+        // gwiazdka przy wyjściu AKTYWNYM (tym, po które WirePlumber sięga przy
+        // linkowaniu), a nie przy zapamiętanym wyborze — ten drugi potrafi
+        // wskazywać urządzenie, którego w tej chwili nie ma w grafie
+        let is_default = if default.effective() == Some(s.name.as_str()) { "*" } else { "" };
         println!(
             "{:>5}  {:<7} {:<4} {:<60} {}",
             s.id, hw, is_default, s.name, s.description
@@ -168,12 +198,28 @@ fn cmd_devices() -> Result<()> {
     Ok(())
 }
 
-fn check_item(failures: &mut usize, cond: bool, msg_ok: String, msg_err: String) {
-    if cond {
-        println!("  OK    {msg_ok}");
-    } else {
-        println!("  BŁĄD  {msg_err}");
-        *failures += 1;
+/// Waga braku zależności toru AI zależy od bramki.
+///
+/// Przy `[audio].translate = false` tor AI w ogóle nie powstaje (cmd_run
+/// pomija `pipeline::spawn`), więc brak modelu whispera, pipera czy klucza API
+/// NIE przeszkadza w uruchomieniu przelotki. Zgłaszanie tego jako BŁĄD dawało
+/// kod wyjścia 1 dla konfiguracji, którą `check` dwie linie wyżej sam nazywał
+/// poprawną. Wypisujemy więc UWAGA i nie ruszamy licznika — informacja
+/// zostaje, werdykt się zmienia.
+struct AiSeverity {
+    fatal: bool,
+}
+
+impl AiSeverity {
+    fn item(&self, failures: &mut usize, cond: bool, msg_ok: String, msg_err: String) {
+        if cond {
+            println!("  OK    {msg_ok}");
+        } else if self.fatal {
+            println!("  BŁĄD  {msg_err}");
+            *failures += 1;
+        } else {
+            println!("  UWAGA {msg_err}\n        (tłumaczenie wyłączone, więc to nie blokuje startu — przelotka ruszy bez tego)");
+        }
     }
 }
 
@@ -208,10 +254,28 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
     if let Some(w) = cfg.tuning_warning() {
         println!("  UWAGA {w}");
     }
+    if let Some(w) = cfg.output_device_warning() {
+        println!("  UWAGA {w}");
+    }
+
+    // Bramka toru AI — wypisana WYSOKO, bo bez niej `check` potrafi
+    // wyświetlić same OK komuś, kto potem nie usłyszy ani słowa lektora
+    // (model, piper i klucz API są sprawne; po prostu nic ich nie woła).
+    // To nie jest BŁĄD: przelotka bez tłumaczenia jest poprawnym trybem.
+    let ai = AiSeverity { fatal: cfg.audio.translate };
+    if cfg.audio.translate {
+        println!("  OK    tłumaczenie WŁĄCZONE ([audio].translate = true)");
+    } else {
+        println!(
+            "  OK    tłumaczenie WYŁĄCZONE (domyślnie) — węzeł jest czystą przelotką: tor AI \
+             w ogóle się nie buduje, więc model whispera, piper i silnik tłumaczenia nie są \
+             potrzebne.\n        Włącz wpisem `translate = true` w sekcji [audio]."
+        );
+    }
 
     // model whisper
     let model = cfg.stt_model();
-    check_item(
+    ai.item(
         &mut failures,
         model.exists(),
         format!("model whisper: {}", model.display()),
@@ -222,7 +286,7 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
         ),
     );
     let name = model.file_name().unwrap_or_default().to_string_lossy().to_string();
-    check_item(
+    ai.item(
         &mut failures,
         // ".en." łapie ggml-base.en.bin; ".en-" łapie kwantyzowane warianty
         // (ggml-small.en-q5_1.bin) — bez tego drugiego warunku przechodziły
@@ -238,13 +302,13 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
     // piper
     let piper_bin = cfg.piper_bin();
     let voice = cfg.piper_voice();
-    check_item(
+    ai.item(
         &mut failures,
         piper_bin.exists(),
         format!("piper: {}", piper_bin.display()),
         format!("brak binarki pipera: {}", piper_bin.display()),
     );
-    check_item(
+    ai.item(
         &mut failures,
         voice.exists(),
         format!("głos: {}", voice.display()),
@@ -252,12 +316,9 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
     );
     match tts::read_voice_sample_rate(&voice) {
         Ok(rate) => println!("  OK    config głosu: {rate} Hz"),
-        Err(e) => {
-            println!("  BŁĄD  config głosu: {e:#}");
-            failures += 1;
-        }
+        Err(e) => ai.item(&mut failures, false, String::new(), format!("config głosu: {e:#}")),
     }
-    check_item(
+    ai.item(
         &mut failures,
         std::fs::create_dir_all(&cfg.tts.work_dir).is_ok(),
         format!("katalog roboczy TTS: {}", cfg.tts.work_dir),
@@ -268,7 +329,7 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
     // akceptuje make_translator, inaczej check przepuszcza literówkę
     // (np. "claud"), a `run` pada dopiero przy starcie pipeline'u
     match cfg.translate.engine.as_str() {
-        "gemini" => check_item(
+        "gemini" => ai.item(
             &mut failures,
             std::env::var("GEMINI_API_KEY")
                 .map(|v| !v.trim().is_empty())
@@ -281,19 +342,13 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
                 "  OK    Ollama: {} ma model \"{}\"",
                 cfg.translate.ollama_host, cfg.translate.ollama_model
             ),
-            Err(e) => {
-                println!("  BŁĄD  {e:#}");
-                failures += 1;
-            }
+            Err(e) => ai.item(&mut failures, false, String::new(), format!("{e:#}")),
         },
         "llamacpp" => match translate::llamacpp_check(&cfg.translate.llamacpp_host) {
             Ok(()) => println!("  OK    llama-server: {} odpowiada", cfg.translate.llamacpp_host),
-            Err(e) => {
-                println!("  BŁĄD  {e:#}");
-                failures += 1;
-            }
+            Err(e) => ai.item(&mut failures, false, String::new(), format!("{e:#}")),
         },
-        "claude" => check_item(
+        "claude" => ai.item(
             &mut failures,
             std::env::var("ANTHROPIC_API_KEY")
                 .map(|v| !v.trim().is_empty())
@@ -312,18 +367,67 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
 
     // pipewire
     match pw::discover_sinks() {
-        Ok((sinks, default)) => {
+        Ok(pw::GraphSnapshot { sinks, defaults: default, session_manager }) => {
             println!("  OK    PipeWire: {} węzłów Audio/Sink", sinks.len());
-            match default.as_deref() {
-                Some(name) => println!("  OK    aktualne domyślne wyjście (odczyt): {name}"),
-                None => println!("  OK    aktualne domyślne wyjście: nie udało się odczytać (użyję heurystyki)"),
-            }
-            match pw::pick_output(&sinks, cfg.audio.output_device.as_deref(), default.as_deref()) {
-                Ok(t) => println!("  OK    cel odtwarzania: {} ({})", t.name, t.description),
-                Err(e) => {
-                    println!("  BŁĄD  {e:#}");
-                    failures += 1;
+            // Bez WirePlumbera `filter.smart` nie znaczy NIC: węzeł powstanie
+            // i zostanie niezlinkowany. To jedyna twarda zależność runtime,
+            // której `check` wcześniej w ogóle nie sprawdzał — i drukował
+            // zielone OK komuś, kto potem nie usłyszy nic.
+            match session_manager.as_deref() {
+                Some(n) if n.starts_with("WirePlumber") => {
+                    println!("  OK    menedżer sesji: {n} (realizuje filter.smart)")
                 }
+                Some(n) => println!(
+                    "  UWAGA menedżer sesji to \"{n}\", a nie WirePlumber — `filter.smart` \
+                     jest polityką WirePlumbera >= 0.5.\n        Bez niego węzeł powstanie, \
+                     ale nikt go nie zlinkuje i translator będzie niemy."
+                ),
+                None => println!(
+                    "  UWAGA nie widzę w grafie klienta WirePlumbera. Jeśli menedżerem sesji \
+                     nie jest WirePlumber >= 0.5,\n        `filter.smart` nie zadziała i \
+                     translator będzie niemy (sprawdź: wireplumber --version)."
+                ),
+            }
+            // OBA klucze osobno. `default.audio.sink` (aktywny) decyduje
+            // o routingu, `default.configured.audio.sink` to zapamiętany wybór
+            // użytkownika i potrafi wskazywać sprzęt, którego nie ma w grafie.
+            // Sklejone w jedno maskowały się nawzajem.
+            match default.active.as_deref() {
+                Some(name) => println!("  OK    aktywne domyślne wyjście (default.audio.sink): {name}"),
+                None => println!("  OK    aktywne domyślne wyjście: nie udało się odczytać"),
+            }
+            match default.configured.as_deref() {
+                Some(name) => println!("  OK    zapamiętany wybór (default.configured.audio.sink): {name}"),
+                None => println!("  OK    zapamiętany wybór wyjścia: brak"),
+            }
+            // Celu NIE sprawdzamy — nie mamy go. Wybiera WirePlumber, a my
+            // wpinamy się w to, co jest domyślne w danej chwili.
+            //
+            // UWAGA, nie BŁĄD: gdy domyślnym wyjściem jest nasz węzeł, dźwięk
+            // MIMO TO gra. find-default-target.lua nie ustawia celu (canLink
+            // odmawia na własnej link-group), ale też nie przerywa
+            // przetwarzania, więc find-best-target.lua pomija inteligentne
+            // filtry i dopina nas do najlepszego sprzętowego sinka. Poprzednia
+            // wersja zwracała tu kod wyjścia 1 za stan, który działa.
+            let us_active = default.active.as_deref() == Some(pw::SINK_NODE_NAME);
+            let us_configured = default.configured.as_deref() == Some(pw::SINK_NODE_NAME);
+            if us_active || us_configured {
+                let które = match (us_active, us_configured) {
+                    (true, true) => "aktywnym domyślnym wyjściem I zapamiętanym wyborem",
+                    (true, false) => "aktywnym domyślnym wyjściem",
+                    _ => "zapamiętanym wyborem wyjścia",
+                };
+                println!(
+                    "  UWAGA {} jest sam translator ({}) — dźwięk będzie grał (WirePlumber \
+                     dopnie nasz strumień do sprzętu przez find-best-target), ale to \
+                     ustawienie jest mylące.\n        Translator jest przelotką, nie \
+                     urządzeniem: wybierz w Ustawieniach systemowych → Dźwięk swój prawdziwy \
+                     sprzęt, a translator wpnie się w tor sam.",
+                    które,
+                    pw::SINK_NODE_NAME
+                );
+            } else {
+                println!("  OK    translator wepnie się w aktualne domyślne wyjście (filter.smart)");
             }
         }
         Err(e) => {
@@ -338,4 +442,34 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
     }
     println!("\nwszystko gotowe — uruchom: nacelle-translator run");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn g1_brak_zaleznosci_ai_nie_wywala_check_gdy_bramka_zamknieta() {
+        // Regresja, którą wypuściła poprzednia wersja: `check` przy
+        // `translate = false` reklamował „czystą przelotkę", a dwie linie
+        // niżej liczył brak modelu whispera i klucza API jako BŁĄD i kończył
+        // kodem 1. Skoro tor AI się wtedy nie buduje (cmd_run), brak jego
+        // zależności nie może być powodem do niezerowego kodu wyjścia.
+        let mut f = 0usize;
+        AiSeverity { fatal: false }.item(&mut f, false, String::new(), "brak modelu".into());
+        assert_eq!(f, 0, "zamknięta bramka nie może podbijać licznika błędów");
+    }
+
+    #[test]
+    fn g2_brak_zaleznosci_ai_dalej_jest_bledem_gdy_bramka_otwarta() {
+        // Druga strona tego samego niezmiennika: przy WŁĄCZONYM tłumaczeniu
+        // brak modelu to nadal twardy błąd — inaczej `check` przepuszczałby
+        // konfigurację, na której `run` padnie przy starcie pipeline'u.
+        let mut f = 0usize;
+        AiSeverity { fatal: true }.item(&mut f, false, String::new(), "brak modelu".into());
+        assert_eq!(f, 1);
+        // spełniony warunek nigdy nie podbija licznika, niezależnie od wagi
+        AiSeverity { fatal: true }.item(&mut f, true, "jest".into(), String::new());
+        assert_eq!(f, 1);
+    }
 }

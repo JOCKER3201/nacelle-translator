@@ -6,14 +6,33 @@
 # — nigdy w tym pliku.
 
 [audio]
-# node.name sprzętowego urządzenia wyjściowego (lista: nacelle-translator devices).
-# Zakomentowane = auto-wykrycie: najpierw aktualne skonfigurowane domyślne
-# wyjście z PipeWire, a gdy to już MY (bo program działa i jest ustawiony
-# jako domyślny) — pierwszy węzeł USB/Bluetooth, potem PCI. Ta druga ścieżka
-# to zgadywanka: gdy masz kilka urządzeń, USTAW TO JAWNIE, żeby zawsze trafiać
-# w konkretny sprzęt niezależnie od tego, co PipeWire uzna w danej chwili za
-# "domyślne" (które po ustawieniu translatora jako default to już on sam).
-#output_device = "alsa_output.usb-Logitech_G522_LIGHTSPEED_-_Wireless_Mode_0000000000000000-00.analog-stereo"
+# Czy dźwięk przechodzący przez węzeł ma być MIELONY PRZEZ AI
+# (VAD → whisper → tłumaczenie → lektor).
+#
+# To NIE jest wyłącznik węzła: przelotka i passthrough działają ZAWSZE,
+# niezależnie od tej wartości. Dźwięk przechodzi przez translator do
+# urządzenia tak samo w obu trybach; ten klucz decyduje wyłącznie o tym, czy
+# po drodze jest dodatkowo analizowany.
+#
+# Domyślnie `false`, bo węzeł stoi w torze CAŁEGO dźwięku systemu. Przy
+# `true` do VAD trafia wszystko — gra, powiadomienie, muzyka — whisper
+# miele to na GPU, lektor odzywa się w środku rozgrywki, a ducking ścisza
+# CAŁY system o ~14 dB przy każdej jego wypowiedzi, także wtedy gdy tłumaczy
+# zupełnie inną aplikację. Włącz świadomie.
+#
+# Przy `false` tor AI w ogóle NIE JEST BUDOWANY: whisper nie ładuje wag do
+# VRAM, piper się nie uruchamia, silnik tłumaczenia nie jest potrzebny.
+# W tym trybie program działa bez pobranego modelu i bez klucza API.
+translate = false
+
+# WYCOFANE. Ten klucz nie robi już NIC i jest przyjmowany wyłącznie po to,
+# żeby stare pliki konfiguracyjne dalej się wczytywały (program raz ostrzega
+# w logu i prosi o usunięcie linii).
+#
+# Powód: translator jest przelotką. Urządzenie wyjściowe wybierasz w KDE
+# tak jak zawsze, a translator wpina się w ten tor sam i podąża za każdą
+# zmianą — bez restartu i bez wskazywania mu czegokolwiek w tym pliku.
+#output_device = "..."   # nie ustawiaj, nie działa
 passthrough_gain = 1.0   # głośność oryginału bez lektora
 duck_gain = 0.2          # głośność oryginału pod lektorem (0.2 ≈ -14 dB)
 tts_gain = 1.0           # głośność lektora
@@ -101,7 +120,7 @@ engine = "gemini"
 model = "claude-opus-4-8"        # model dla silnika "claude"; taniej: "claude-haiku-4-5"
 gemini_model = "gemini-3.5-flash-lite" # najszybszy wariant — kluczowy dla czasu rzeczywistego
 ollama_host = "http://localhost:11434"
-ollama_model = "gemma"           # tag modelu w Ollamie (u mnie: Gemma 4, Q4_K_M)
+ollama_model = "gemma"           # tag modelu w Ollamie (np. Gemma, Q4_K_M)
 llamacpp_host = "http://localhost:8080" # adres llama-server (uruchamiany z --no-jinja)
 target_language = "polski"       # nazwa języka używana w prompcie
 target_lang_code = "pl"          # kod porównywany z detekcją whispera

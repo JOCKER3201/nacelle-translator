@@ -15,9 +15,25 @@ pub struct Config {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AudioCfg {
-    /// node.name sprzętowego sinka; nieobecny/zakomentowany lub pusty =
-    /// automatyczny wybór pierwszego urządzenia ALSA/Bluetooth
+    /// WYCOFANY — bez znaczenia od przejścia na model przelotki.
+    ///
+    /// Klucz ZOSTAJE w strukturze, mimo że program go nie używa, bo wszystkie
+    /// sekcje mają `deny_unknown_fields`: usunięcie pola wywaliłoby wczytanie
+    /// CAŁEGO pliku każdemu, kto ma tę linię z poprzedniej wersji. Zamiast
+    /// tego przyjmujemy go i mówimy raz, głośno, że nic nie robi
+    /// (`output_device_warning`).
     pub output_device: Option<String>,
+    /// Czy dźwięk w ogóle wchodzi do toru AI (VAD → whisper → tłumaczenie →
+    /// lektor). NIE dotyczy passthrough: dźwięk przechodzi przez węzeł
+    /// zawsze, niezależnie od tej wartości.
+    ///
+    /// DOMYŚLNIE `false`, i to jest decyzja, nie przeoczenie. Węzeł jest
+    /// przelotką w torze CAŁEGO systemu, więc `true` znaczy: każdy dźwięk
+    /// (gra, powiadomienie, muzyka) leci do VAD, whisper miele go na GPU,
+    /// lektor odzywa się w losowym momencie, a ducking ścisza CAŁY system
+    /// o ~14 dB przy każdej jego wypowiedzi. To musi być świadomy wybór
+    /// użytkownika, a nie zachowanie pierwszego uruchomienia po `git clone`.
+    pub translate: bool,
     pub passthrough_gain: f32,
     /// głośność oryginału, gdy mówi lektor (0.2 ≈ -14 dB)
     pub duck_gain: f32,
@@ -31,6 +47,7 @@ impl Default for AudioCfg {
     fn default() -> Self {
         Self {
             output_device: None,
+            translate: false,
             passthrough_gain: 1.0,
             duck_gain: 0.2,
             tts_gain: 1.0,
@@ -337,6 +354,25 @@ impl Config {
         }
         None
     }
+
+    /// Ostrzeżenie o wycofanym `[audio].output_device`.
+    ///
+    /// Milczenie byłoby tu gorsze niż hałas: użytkownik, który ma tę linię
+    /// z poprzedniej wersji, jest przekonany, że wskazał urządzenie — a dziś
+    /// wybiera je WirePlumber i wpis nie robi nic. Bez tego zdania rozjazd
+    /// „ustawiłem X, a gra w Y" byłby nie do rozgryzienia z logu.
+    ///
+    /// Pusta wartość (`output_device = ""`) znaczyła kiedyś „wybierz sam",
+    /// czyli dokładnie to, co dzieje się teraz zawsze — nie ma o czym mówić.
+    pub fn output_device_warning(&self) -> Option<String> {
+        let name = self.audio.output_device.as_deref().filter(|s| !s.is_empty())?;
+        Some(format!(
+            "[audio].output_device = \"{name}\" jest WYCOFANY i nic nie robi — translator jest \
+             przelotką: wpina się w to wyjście, które masz wybrane w KDE, i podąża za jego \
+             zmianami. Usuń tę linię z nacelle-translator.toml, a urządzenie wybieraj tak jak \
+             każde inne, w Ustawieniach systemowych → Dźwięk."
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +409,36 @@ mod tests {
         cfg.stt.speculative = false;
         cfg.vad.soft_max_ms = 2_000;
         assert!(cfg.tuning_warning().is_none());
+    }
+
+    #[test]
+    fn wycofany_output_device_jest_przyjmowany_ale_glosno() {
+        // NIE wolno wywalić parsowania: linia zostaje w plikach użytkowników
+        // z poprzedniej wersji, a `deny_unknown_fields` zabiłby cały plik
+        let cfg = parse_str("[audio]\noutput_device = \"alsa_output.x\"\n", Path::new("x.toml"))
+            .unwrap();
+        let w = cfg.output_device_warning().expect("wpis musi być skomentowany");
+        assert!(w.contains("alsa_output.x"), "{w}");
+        assert!(w.contains("WYCOFANY"), "{w}");
+        // brak klucza i pusta wartość znaczą to samo co dzisiejsze zachowanie
+        assert!(Config::default().output_device_warning().is_none());
+        let pusty = parse_str("[audio]\noutput_device = \"\"\n", Path::new("x.toml")).unwrap();
+        assert!(pusty.output_device_warning().is_none());
+    }
+
+    #[test]
+    fn tlumaczenie_domyslnie_wylaczone_i_wlaczane_z_pliku() {
+        // brak klucza = przelotka bez AI (patrz doc-komentarz pola)
+        assert!(!parse_str("", Path::new("x.toml")).unwrap().audio.translate);
+        assert!(!Config::default().audio.translate);
+        // i włącza je WYŁĄCZNIE jawny wpis użytkownika
+        let cfg = parse_str("[audio]\ntranslate = true\n", Path::new("x.toml")).unwrap();
+        assert!(cfg.audio.translate);
+        // sąsiednie klucze sekcji dalej działają normalnie
+        let cfg = parse_str("[audio]\ntranslate = true\nduck_gain = 0.5\n", Path::new("x.toml"))
+            .unwrap();
+        assert!(cfg.audio.translate);
+        assert_eq!(cfg.audio.duck_gain, 0.5);
     }
 
     #[test]

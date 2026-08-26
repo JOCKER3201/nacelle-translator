@@ -901,6 +901,85 @@ fn synth_with_restart(
     }
 }
 
+/// Budżet BEZ POSTĘPU w pchaniu klipu do ringu odtwarzania. Nie jest to
+/// budżet całkowity — długi klip legalnie pcha się przez czas swojego
+/// trwania; liczy się dopiero czas, przez który `push_slice` nie przyjął ANI
+/// JEDNEJ próbki.
+///
+/// Dobór 10 s: ring TTS ma 3 s (main.rs) i jest drenowany w tempie realnym,
+/// więc 10 s całkowitego braku postępu znaczy, że callback odtwarzania nie był
+/// wołany od co najmniej ~7 s — to nie zacięcie, tylko zatrzymanie. Zarazem
+/// 10 s to 5x margines nad najdłuższą znaną legalną blokadą po stronie
+/// WirePlumbera (2000 ms blokady rescanu po zniknięciu węzła bluez5,
+/// linking/rescan.lua).
+///
+/// ZAKRES — CZEGO TEN ZATRZASK **NIE** ŁAPIE. Chroni przed ZATRZYMANIEM
+/// ZEGARA GRAFU: zawieszony serwer PipeWire, freewheeling, węzeł uśpiony
+/// z zewnątrz. NIE chroni przed utratą celu odtwarzania. Odlinkowany węzeł
+/// dalej dostaje `process()` („normally idle nodes keep processing",
+/// man 7 pipewire-props; node/suspend-node.lua filtruje `Audio/*`, więc
+/// naszego `Stream/Output/Audio` nie usypia), więc ring DALEJ się drenuje,
+/// `push_slice` dalej zwraca `n > 0` i zatrzask nigdy nie zadziała — mowa
+/// lektora jest wtedy po cichu zjadana przez węzeł grający w próżnię.
+///
+/// UTRATA CELU NIE JEST DZIŚ WYKRYWANA NIGDZIE — i tak ma być. W modelu
+/// przelotki (pw.rs) przejściowy brak celu to ścieżka NORMALNA: zdarza się
+/// przy każdym przełączeniu urządzenia i przy każdym uśpieniu słuchawek,
+/// a demon ma to przeżyć dowolną liczbę razy. Dawny czujnik
+/// (`node.dont-fallback`) został usunięty, bo przy `filter.smart` kazał
+/// WirePlumberowi NISZCZYĆ nasz węzeł (find-filter-target.lua, gałąź
+/// `is_smart_filter and dont_fallback`: `sendClientError` +
+/// `node:request_destroy()`). Cena tej zmiany, wpisana tu wprost, żeby nikt
+/// jej nie odkrywał od nowa: w oknie bez zlinkowanego celu mowa lektora
+/// przepada po cichu i nie zwiększa `dropped_finals`. Gdyby kiedyś była
+/// potrzebna obserwowalność tego okna, właściwym narzędziem jest osobny
+/// licznik „cykli odtwarzania bez celu", a nie przywracanie dont-fallback.
+const TTS_PUSH_STALL_BUDGET: Duration = Duration::from_secs(10);
+/// Jak często meldować o porzucaniu, dopóki zatrzask trwa (jeden zbiorczy
+/// komunikat zamiast jednego na każdy klip).
+const TTS_STALL_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Co zrobić z resztą klipu, której ring TTS nie przyjmuje.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum StallAction {
+    /// czekaj i próbuj dalej (ring daje naturalny backpressure)
+    Push,
+    /// budżet wyczerpany — przełącz się w stan zatrzymanego odtwarzania
+    Latch,
+    /// zatrzask trwa — porzuć NATYCHMIAST, bez czekania
+    Abandon,
+}
+
+/// Decyzja producenta ringu TTS.
+///
+/// Sam timeout per klip NIE WYSTARCZA: warunek „odtwarzanie nie jest
+/// zegarowane" jest stanem trwałym, więc każdy następny klip płaciłby kolejne
+/// 10 s czekania. Cały tor AI to łańcuch kanałów `bounded(1)` z blokującym
+/// send, więc STT i MT dławiłyby się do tempa 1 klip / 10 s na czas
+/// nieokreślony, a ring capture przepełniałby się w tle. Dlatego zatrzask:
+/// raz przekroczony budżet przełącza w tryb natychmiastowego porzucania,
+/// z którego wychodzi się dopiero po stwierdzeniu, że ring znów się drenuje.
+fn stall_decision(no_progress: Duration, latched: bool, budget: Duration) -> StallAction {
+    if latched {
+        StallAction::Abandon
+    } else if no_progress >= budget {
+        StallAction::Latch
+    } else {
+        StallAction::Push
+    }
+}
+
+/// Czy odtwarzanie znów drenuje ring TTS?
+///
+/// Producent nie ma jak opróżnić ringu (SPSC: pop należy do konsumenta), więc
+/// wyjście z zatrzasku poznajemy po tym, że konsument sam zrobił miejsce.
+/// Próg 3/4 pojemności jest wyraźnie powyżej szumu: pojedynczy kwant to
+/// ułamek procenta 3-sekundowego ringu, więc tak duże wolne miejsce może
+/// powstać wyłącznie przez systematyczny drenaż.
+fn playback_resumed(vacant: usize, capacity: usize) -> bool {
+    vacant * 4 >= capacity * 3
+}
+
 #[allow(clippy::too_many_arguments)]
 fn tts_thread(
     mut piper: PiperTts,
@@ -923,15 +1002,28 @@ fn tts_thread(
 
     // księgowość porzuceń jak w translate_thread — ostatnia bramka przed
     // głośnikiem, więc jej licznik jest najbliższym odpowiednikiem „ile treści
-    // realnie nie usłyszał słuchacz"
+    // realnie nie usłyszał słuchacz". Liczy OBIE drogi porzucenia: budżet
+    // wieku (MAX_JOB_AGE) i zatrzask zatrzymanego odtwarzania. Sumaryczny,
+    // nigdy nie zerowany.
     let mut dropped_finals: u64 = 0;
+
+    // zatrzask „odtwarzanie stoi" — patrz `stall_decision`
+    let mut stalled = false;
+    let mut stalled_clips: u64 = 0;
+    let mut stalled_secs: f32 = 0.0;
+    let mut stalled_since = Instant::now();
+    let mut last_stall_log = Instant::now();
 
     while let Ok(job) = tts_rx.recv() {
         let label = job.kind.label(job.id);
         let age = job.created.elapsed();
         // M2: fragmenty spekulacyjne zwolnione z budżetu porzucania — commit
         // to obietnica dostarczenia; tryb doganiania niżej dalej działa
-        // (przyspiesza odczyt, niczego nie porzuca)
+        // (przyspiesza odczyt, niczego nie porzuca).
+        // GRANICA TEJ OBIETNICY: zwolnienie dotyczy WYŁĄCZNIE budżetu wieku.
+        // Gdy odtwarzanie stoi, zatrzask niżej porzuca fragmenty tak samo jak
+        // ogony — nie ma dokąd ich dostarczyć, a czekanie zablokowałoby cały
+        // tor AI (łańcuch kanałów bounded(1) z blokującym send).
         if !matches!(job.kind, JobKind::Fragment { .. }) && age > MAX_JOB_AGE {
             dropped_finals += 1;
             log::warn!(
@@ -1011,14 +1103,78 @@ fn tts_thread(
                 Tempo::Doganianie => ", tryb doganiania",
             }
         );
-        // push z czekaniem — ring daje naturalny backpressure
+        // Zatrzask: sprawdź najpierw, czy odtwarzanie nie ruszyło z powrotem.
+        if stalled && playback_resumed(tts_prod.vacant_len(), tts_prod.capacity().get()) {
+            log::warn!(
+                "odtwarzanie ruszyło po {:.0}s — wracam do wpychania mowy lektora \
+                 (w międzyczasie porzucone: {stalled_clips} klipów, {stalled_secs:.1}s mowy)",
+                stalled_since.elapsed().as_secs_f32()
+            );
+            stalled = false;
+            stalled_clips = 0;
+            stalled_secs = 0.0;
+        }
+
+        let clip_secs = clip48.len() as f32 / crate::pw::RATE as f32;
+        // push z czekaniem — ring daje naturalny backpressure, ale NIE bez
+        // końca: bez limitu wątek TTS zawisa na zawsze, gdy callback
+        // odtwarzania przestaje być wołany, i wstrzymuje CAŁY tor AI
+        // (STT → MT → TTS to łańcuch kanałów bounded(1) z blokującym send),
+        // bez zgłoszenia czegokolwiek przez HealthGuard — wątek przecież żyje.
+        // Zakres tego zabezpieczenia (zatrzymany ZEGAR grafu, a nie utrata
+        // celu odtwarzania) opisany przy TTS_PUSH_STALL_BUDGET.
         let mut rest = &clip48[..];
-        while !rest.is_empty() {
-            let n = tts_prod.push_slice(rest);
-            rest = &rest[n..];
-            if !rest.is_empty() {
-                std::thread::sleep(Duration::from_millis(20));
+        let mut last_progress = Instant::now();
+        loop {
+            match stall_decision(last_progress.elapsed(), stalled, TTS_PUSH_STALL_BUDGET) {
+                // `dropped_finals` jest sumaryczne i NIGDY nie zerowane — to
+                // jedyny licznik „ile treści realnie nie usłyszał słuchacz".
+                // `stalled_*` liczą wyłącznie bieżące okno zatrzasku i giną
+                // przy wznowieniu; gdyby porzucenia zatrzasku szły tylko tam,
+                // informacja o utraconej mowie znikałaby bez śladu.
+                StallAction::Abandon => {
+                    dropped_finals += 1;
+                    stalled_clips += 1;
+                    stalled_secs += rest.len() as f32 / crate::pw::RATE as f32;
+                    if last_stall_log.elapsed() >= TTS_STALL_LOG_INTERVAL {
+                        log::warn!(
+                            "odtwarzanie stoi od {:.0}s — porzucam mowę lektora na bieżąco \
+                             ({stalled_clips} klipów, {stalled_secs:.1}s mowy; ostatni wiek \
+                             zadania {:.1}s; porzuconych ogonów łącznie: {dropped_finals})",
+                            stalled_since.elapsed().as_secs_f32(),
+                            age_now.as_secs_f32()
+                        );
+                        last_stall_log = Instant::now();
+                    }
+                    break;
+                }
+                StallAction::Latch => {
+                    dropped_finals += 1;
+                    stalled = true;
+                    stalled_since = Instant::now();
+                    last_stall_log = Instant::now();
+                    stalled_clips = 1;
+                    stalled_secs = rest.len() as f32 / crate::pw::RATE as f32;
+                    log::warn!(
+                        "#{label} odtwarzanie nie przyjmuje próbek od {}s — porzucam \
+                         {stalled_secs:.1}s z {clip_secs:.1}s mowy lektora i przechodzę \
+                         w tryb porzucania, żeby nie zablokować toru AI \
+                         (porzuconych ogonów łącznie: {dropped_finals})",
+                        TTS_PUSH_STALL_BUDGET.as_secs()
+                    );
+                    break;
+                }
+                StallAction::Push => {}
             }
+            let n = tts_prod.push_slice(rest);
+            if n > 0 {
+                last_progress = Instant::now();
+            }
+            rest = &rest[n..];
+            if rest.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }
@@ -1026,6 +1182,53 @@ fn tts_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const B: Duration = TTS_PUSH_STALL_BUDGET;
+
+    #[test]
+    fn s1_swiezy_klip_pcha_normalnie() {
+        assert_eq!(
+            stall_decision(Duration::from_millis(0), false, B),
+            StallAction::Push
+        );
+        assert_eq!(
+            stall_decision(Duration::from_secs(9), false, B),
+            StallAction::Push
+        );
+    }
+
+    #[test]
+    fn s2_brak_postepu_ponad_budzet_zatrzaskuje() {
+        assert_eq!(stall_decision(B, false, B), StallAction::Latch);
+        assert_eq!(
+            stall_decision(Duration::from_secs(11), false, B),
+            StallAction::Latch
+        );
+    }
+
+    #[test]
+    fn s3_zatrzask_porzuca_natychmiast_bez_czekania() {
+        // kluczowe: przy ustawionym zatrzasku ŻADEN czas nie daje Push —
+        // inaczej każdy następny klip płaciłby kolejne 10 s i tor AI stałby
+        assert_eq!(
+            stall_decision(Duration::from_millis(0), true, B),
+            StallAction::Abandon
+        );
+        assert_eq!(
+            stall_decision(Duration::from_secs(3600), true, B),
+            StallAction::Abandon
+        );
+    }
+
+    #[test]
+    fn s4_wznowienie_dopiero_po_realnym_drenazu() {
+        let cap = 48_000 * 3; // ring TTS: mono, 3 s
+        assert!(!playback_resumed(0, cap)); // ring pełny
+        assert!(!playback_resumed(1024, cap)); // jeden kwant to nie drenaż
+        assert!(!playback_resumed(cap / 2, cap)); // połowa to jeszcze nie
+        assert!(playback_resumed(cap * 3 / 4, cap)); // dokładnie próg
+        assert!(playback_resumed(cap, cap)); // pusty
+    }
 
     /// tempo nominalne: świeże zadanie, tłumaczenie mieszczące się w oryginale
     #[test]
