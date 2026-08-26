@@ -2,23 +2,53 @@
 //! odtwarzania wycelowany w sprzętowe urządzenie. Callbacki RT wymieniają
 //! próbki z resztą programu wyłącznie przez lock-free ringbuffery SPSC.
 //!
-//! Ochrona przed pętlą (gdy nasz sink jest domyślnym urządzeniem):
-//!  1. target.object = node.name sprzętu (PipeWire ≥ 0.3.64 przyjmuje nazwę),
-//!  2. StreamFlags::DONT_RECONNECT — po zniknięciu celu strumień pada,
-//!     zamiast wracać do domyślnego sinka (czyli naszego),
-//!  3. node.link-group o tej samej wartości na obu strumieniach
-//!     (wzorzec z module-loopback),
+//! Ochrona przed pętlą (gdy nasz sink jest domyślnym urządzeniem). Opis stanu
+//! FAKTYCZNEGO, sprawdzonego w źródłach WirePlumbera 0.5.12 na tej maszynie —
+//! nie deklaracji:
+//!  1. `target.object` = node.name sprzętu RAZEM z `node.dont-fallback=true`.
+//!     Sam `target.object` nie blokuje NICZEGO: gdy dopasowanie nie trafi,
+//!     linking/find-defined-target.lua:82-94 zostawia `target_picked=false`
+//!     i oddaje sterowanie dalej, aż do linking/find-default-target.lua,
+//!     czyli do domyślnego sinka — a tym może być NASZ sink. Dopiero
+//!     `node.dont-fallback` (czytane w find-defined-target.lua:38 wprost
+//!     z właściwości węzła; to klucz WirePlumbera, PipeWire go nie zna)
+//!     włącza gałąź :116-127: `sendClientError` + `node:request_destroy()`
+//!     + `event:stop_processing()` — czyli ucina jakikolwiek fallback
+//!     i zamienia cichy zawis w głośny błąd. Świadomy koszt: przejściowa
+//!     nieobecność celu (przełączanie profilu karty, uśpienie słuchawek)
+//!     też kończy proces — głośno i z instrukcją, zamiast zostawiać niemego
+//!     zombie, którym byliśmy wcześniej.
+//!  2. StreamFlags::DONT_RECONNECT — UWAGA, to NIE jest ochrona przed
+//!     fallbackiem przy PIERWSZYM linkowaniu (prepare-link.lua sięga wtedy po
+//!     domyślny sink tak samo). Działa dopiero po pierwszym udanym
+//!     zlinkowaniu i wtedy działa aż za dobrze: prepare-link.lua:72-76
+//!     (`if not reconnect and si_flags.was_handled then target = nil;
+//!     goto done end`) przeskakuje ZARÓWNO `sendClientError`, JAK
+//!     I `node:request_destroy()`. Bez punktu 1 zniknięcie celu daje więc
+//!     niemego zombie bez jednego wiersza w logu.
+//!  3. `node.link-group` o tej samej wartości na obu strumieniach — jedyny
+//!     zamek, który nie zależy od naszych właściwości: linking-utils.lua
+//!     `canLinkGroupCheck` odmawia linkowania węzłów o tej samej wartości
+//!     i rekurencyjnie (do 8 hopów) wykrywa pętle pośrednie.
 //!  4. przy automatycznym wyborze celu odfiltrowujemy własne węzły I każdy
 //!     wirtualny sink obcego pochodzenia (akceptujemy tylko sprzęt ALSA/BT).
 //!
 //! Odporność: oba strumienie rejestrują `state_changed`. Prawdziwy błąd
-//! strumienia (`stream.state()` faktycznie w Error) albo zniknięcie węzła
-//! (DONT_RECONNECT niszczy węzeł playbacku, gdy cel przepada) kończy program
-//! głośno zamiast zostawiać go jako cichego zombie. Rutynowy błąd sesyjny od
-//! WirePlumbera — dostarczany jako zdarzenie `Error` BEZ zmiany stanu
-//! strumienia — jest tylko logowany; szczegóły przy `verdict`. To samo
-//! dotyczy śmierci dowolnego wątku toru AI — sygnalizuje ją `health_rx`
-//! przekazany z `pipeline::spawn`.
+//! strumienia (`stream.state()` faktycznie w Error) albo przejście
+//! w `Unconnected` (serwer zniszczył węzeł albo zerwało się połączenie)
+//! kończy program głośno zamiast zostawiać go jako cichego zombie. Rutynowy
+//! błąd sesyjny od WirePlumbera — dostarczany jako zdarzenie `Error` BEZ
+//! zmiany stanu strumienia — jest tylko logowany, z dławieniem; szczegóły
+//! przy `verdict`. To samo dotyczy śmierci dowolnego wątku toru AI —
+//! sygnalizuje ją `health_rx` przekazany z `pipeline::spawn`.
+//!
+//! CZEGO TU NIE MA: cel odtwarzania jest ustalany RAZ, przy starcie
+//! (`pick_output`), i NIE podąża za zmianą domyślnego wyjścia w KDE.
+//! `lutils.checkFollowDefault` (linking-utils.lua:180-184) wymaga
+//! `reconnect and not is_filter`, a my mamy i DONT_RECONNECT, i
+//! `node.link-group` (`is_filter = si_props["node.link-group"] ~= nil`).
+//! Zmiana wyjścia w aplecie jest więc dla nas wyłącznie LOGOWANA
+//! (`DefaultSinkWatch`), a faktyczne przepięcie wymaga restartu programu.
 
 use anyhow::{bail, Result};
 use pipewire as pw;
@@ -56,9 +86,13 @@ const DROP_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 /// wolno dodać dopiero, gdy ta liczba jest znana, i z celem dobranym do niej,
 /// a nie do liczby z kartki.
 ///
-/// Zapis z callbacku RT: trzy operacje atomowe `Relaxed` na cykl, bez blokad,
+/// Zapis z callbacku RT: pięć operacji atomowych `Relaxed` na cykl, bez blokad,
 /// bez alokacji, bez IO.
-#[derive(Default)]
+///
+/// CELOWO bez `#[derive(Default)]`: `min` musi startować z `u64::MAX`, inaczej
+/// `fetch_min` nigdy nie zejdzie poniżej zera i struktura na zawsze raportuje
+/// „min 0,0 ms" — cicho, wiarygodnie i fałszywie, w jedynej metryce, dla której
+/// ta struktura powstała. Jedyny konstruktor to `new()`.
 pub struct PassStats {
     /// zaległość (w próbkach f32, stereo interleaved) z ostatniego cyklu
     last: AtomicU64,
@@ -66,7 +100,8 @@ pub struct PassStats {
     min: AtomicU64,
     /// maksimum od ostatniego raportu
     max: AtomicU64,
-    /// `buf.requested()` z ostatniego cyklu — faktyczny kwant grafu
+    /// największy NIEZEROWY `buf.requested()` w oknie; 0 znaczy „graf ani razu
+    /// nie podał kwantu" (adapter, req=0), a nie „kwant wynosi zero"
     quantum: AtomicU64,
     /// liczba cykli od ostatniego raportu
     cycles: AtomicU64,
@@ -99,7 +134,14 @@ impl PassStats {
         self.last.store(backlog_samples, Ordering::Relaxed);
         self.min.fetch_min(backlog_samples, Ordering::Relaxed);
         self.max.fetch_max(backlog_samples, Ordering::Relaxed);
-        self.quantum.store(quantum_frames, Ordering::Relaxed);
+        // `requested == 0` jest legalne (adapter nie sugeruje kwantu — patrz
+        // FALLBACK_FRAMES) i NIE jest zmierzonym kwantem. Przy `store`
+        // wystarczyłby JEDEN taki cykl na końcu okna, żeby raport wypisał
+        // „kwant 0 ramek = 0.0 ms", a przyszły regulator zaległości (cel
+        // liczony z kwantu) dostał zero jako podstawę.
+        if quantum_frames > 0 {
+            self.quantum.fetch_max(quantum_frames, Ordering::Relaxed);
+        }
         self.cycles.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -110,6 +152,9 @@ impl PassStats {
         let cycles = self.cycles.swap(0, Ordering::Relaxed);
         let min = self.min.swap(u64::MAX, Ordering::Relaxed);
         let max = self.max.swap(0, Ordering::Relaxed);
+        // kwant też należy do okna — inaczej raport pokazywałby wartość
+        // odziedziczoną po oknie, w którym graf jeszcze coś podawał
+        let quantum = self.quantum.swap(0, Ordering::Relaxed);
         if cycles == 0 || min == u64::MAX {
             return None;
         }
@@ -117,7 +162,7 @@ impl PassStats {
             min_samples: min,
             max_samples: max,
             last_samples: self.last.load(Ordering::Relaxed),
-            quantum_frames: self.quantum.load(Ordering::Relaxed),
+            quantum_frames: quantum,
             cycles,
         })
     }
@@ -290,12 +335,20 @@ fn enumerate_sinks(
 /// zrzut jej właściwości (wysyłany przez serwer zaraz po bind) już dotarł —
 /// bez tego jest realne ryzyko wyścigu (pierwszy `done` mógłby przyjść
 /// zanim serwer w ogóle przetworzy nasz `bind`).
-fn read_default_sink_name(mainloop: &pw::main_loop::MainLoopRc, core: &pw::core::CoreRc) -> Option<String> {
+///
+/// Zwraca też `DefaultSinkWatch` — uchwyty trzymające podpięcie przy życiu.
+/// Dopóki żyją, `property()` woła się przy KAŻDEJ późniejszej zmianie
+/// domyślnego wyjścia (kliknięcie w aplecie KDE) bez odpytywania.
+fn read_default_sink_name(
+    mainloop: &pw::main_loop::MainLoopRc,
+    core: &pw::core::CoreRc,
+) -> (Option<String>, DefaultSinkWatch) {
+    let our_target: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let registry = match core.get_registry_rc() {
         Ok(r) => r,
         Err(e) => {
             log::debug!("nie mogę pobrać rejestru do odczytu domyślnego wyjścia: {e:#}");
-            return None;
+            return (None, DefaultSinkWatch::inert(our_target));
         }
     };
     let metadata_bound: Rc<RefCell<Option<pw::metadata::Metadata>>> = Rc::new(RefCell::new(None));
@@ -312,6 +365,7 @@ fn read_default_sink_name(mainloop: &pw::main_loop::MainLoopRc, core: &pw::core:
             let metadata_listener = metadata_listener.clone();
             let configured = configured.clone();
             let active = active.clone();
+            let our_target = our_target.clone();
             move |g| {
                 if g.type_ != pw::types::ObjectType::Metadata
                     || metadata_bound.borrow().is_some()
@@ -329,16 +383,39 @@ fn read_default_sink_name(mainloop: &pw::main_loop::MainLoopRc, core: &pw::core:
                     .property({
                         let configured = configured.clone();
                         let active = active.clone();
+                        let our_target = our_target.clone();
                         move |_subject, key, _type_, value| {
-                            let target = match key {
+                            let slot = match key {
                                 Some("default.configured.audio.sink") => Some(&configured),
                                 Some("default.audio.sink") => Some(&active),
                                 _ => None,
                             };
-                            if let (Some(slot), Some(v)) = (target, value) {
+                            if let (Some(slot), Some(v)) = (slot, value) {
                                 if let Ok(j) = serde_json::from_str::<serde_json::Value>(v) {
                                     if let Some(n) = j["name"].as_str() {
                                         *slot.borrow_mut() = Some(n.to_string());
+                                        // `our_target` jest wypełniane dopiero po
+                                        // `pick_output`, więc przy starcie ta gałąź
+                                        // milczy — odzywa się WYŁĄCZNIE przy
+                                        // późniejszej zmianie zrobionej przez
+                                        // użytkownika.
+                                        if key == Some("default.configured.audio.sink") {
+                                            if let Some(t) = our_target.borrow().as_deref() {
+                                                if n != t && n != SINK_NODE_NAME {
+                                                    log::warn!(
+                                                        "domyślne wyjście dźwięku zmieniono na \
+                                                         \"{n}\", ale translator gra dalej w \
+                                                         \"{t}\" — cel jest ustalany raz, przy \
+                                                         starcie, i nie podąża za apletem \
+                                                         (DONT_RECONNECT + node.link-group \
+                                                         wyłączają checkFollowDefault \
+                                                         WirePlumbera). Żeby przepiąć: \
+                                                         zrestartuj translator (albo wskaż cel \
+                                                         w [audio].output_device)."
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -370,7 +447,7 @@ fn read_default_sink_name(mainloop: &pw::main_loop::MainLoopRc, core: &pw::core:
         Ok(())
     })() {
         log::debug!("odczyt domyślnego wyjścia: {e:#}");
-        return None;
+        return (None, DefaultSinkWatch::inert(our_target));
     }
 
     // przebieg 2: gwarantuje dotarcie początkowego zrzutu property() z metadanych
@@ -391,10 +468,52 @@ fn read_default_sink_name(mainloop: &pw::main_loop::MainLoopRc, core: &pw::core:
         Ok(())
     })() {
         log::debug!("odczyt domyślnego wyjścia (przebieg 2): {e:#}");
-        return None;
+        return (None, DefaultSinkWatch::inert(our_target));
     }
 
-    configured.take().or_else(|| active.take())
+    // `borrow().clone()` zamiast `take()`: podpięcie ma żyć dalej i porównywać
+    // przyszłe zmiany, więc nie wolno opróżnić slotów.
+    let name = configured
+        .borrow()
+        .clone()
+        .or_else(|| active.borrow().clone());
+    let watch = DefaultSinkWatch {
+        our_target,
+        _md: metadata_bound.take(),
+        _md_listener: metadata_listener.take(),
+    };
+    (name, watch)
+}
+
+/// Żywe podpięcie do obiektu metadanych "default" — WYŁĄCZNIE do odczytu.
+///
+/// Dopóki uchwyty żyją, serwer woła nasz `property()` przy każdej zmianie
+/// domyślnego wyjścia. Program niczego tu nie zapisuje ani nie przełącza;
+/// jedyny efekt zmiany to ostrzeżenie w logu, że translator gra dalej
+/// w urządzenie wybrane przy starcie (patrz nagłówek pliku, „CZEGO TU NIE
+/// MA"). Bez tego podpięcia rozjazd „wybrałem głośniki, a słychać słuchawki"
+/// jest całkowicie niewidoczny.
+struct DefaultSinkWatch {
+    /// nazwa węzła, w który faktycznie gramy; wypełniana po `pick_output`
+    our_target: Rc<RefCell<Option<String>>>,
+    _md: Option<pw::metadata::Metadata>,
+    _md_listener: Option<pw::metadata::MetadataListener>,
+}
+
+impl DefaultSinkWatch {
+    /// wariant bez podpięcia (nie udało się dobić do metadanych) — wszystkie
+    /// metody działają, tylko nikt nigdy nie zawoła `property()`
+    fn inert(our_target: Rc<RefCell<Option<String>>>) -> Self {
+        Self {
+            our_target,
+            _md: None,
+            _md_listener: None,
+        }
+    }
+
+    fn set_target(&self, name: &str) {
+        *self.our_target.borrow_mut() = Some(name.to_string());
+    }
 }
 
 /// Enumeracja węzłów Audio/Sink + odczyt aktualnie skonfigurowanego
@@ -405,7 +524,7 @@ pub fn discover_sinks() -> Result<(Vec<SinkInfo>, Option<String>)> {
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
     let sinks = enumerate_sinks(&mainloop, &core)?;
-    let default = read_default_sink_name(&mainloop, &core);
+    let (default, _watch) = read_default_sink_name(&mainloop, &core);
     Ok((sinks, default))
 }
 
@@ -533,55 +652,106 @@ enum Verdict {
 /// z niemym zombie po prawdziwym błędzie — a jedno i drugie jest gorsze niż
 /// dzisiejsze zachowanie.
 ///
-/// `Unconnected` po tym, jak węzeł już raz działał, zostaje fatalne: po
-/// stronie klienta ten stan powstaje wyłącznie w `proxy_removed`,
-/// `proxy_destroy` i w `on_core_error` przy `res == -EPIPE` — czyli albo
-/// straciliśmy serwer, albo (dopóki na strumieniu odtwarzania stoi
-/// DONT_RECONNECT) zniknął cel. Odlinkowanie samo w sobie NIE daje
-/// `Unconnected`: „normally idle nodes keep processing" (man 7 pipewire-props).
-fn verdict(new: &StreamState, stream_state_is_error: bool, was_active: bool) -> Verdict {
+/// `Unconnected` jest fatalne BEZWARUNKOWO. Wcześniejsza bramka „dopiero po
+/// pierwszym Streaming/Paused" była nie tylko zbędna, ale szkodliwa:
+///  * `stream_set_state` emituje `state_changed` wyłącznie przy FAKTYCZNEJ
+///    zmianie, a stanem początkowym jest `Unconnected` ustawiane bez emisji
+///    w `pw_stream_new` — zdarzenie `new == Unconnected` z definicji znaczy
+///    więc, że już raz z tego stanu wyszliśmy;
+///  * przy PIERWSZEJ nieudanej próbie linkowania WirePlumber robi
+///    `sendClientError` (zdarzenie Error → Warn) i NATYCHMIAST
+///    `node:request_destroy()` (→ `proxy_removed` → Unconnected). Z bramką
+///    o przeżyciu procesu decydował wyścig między klienckim przejściem
+///    CONNECTING→PAUSED a zniszczeniem węzła przez serwer. Fatalność
+///    strażnika nie może zależeć od wyścigu.
+///
+/// Uwaga na kolejność zamykania w `run_graph`: nasze własne `disconnect()`
+/// też daje `Unconnected`, dlatego `fatal` jest ODCZYTYWANE PRZED
+/// rozłączeniem strumieni — inaczej każdy czysty Ctrl+C kończyłby się
+/// fałszywym alarmem i uczył ignorować dokładnie ten komunikat.
+fn verdict(new: &StreamState, stream_state_is_error: bool) -> Verdict {
     match new {
         StreamState::Error(_) if stream_state_is_error => Verdict::Fatal,
         StreamState::Error(_) => Verdict::Warn,
-        StreamState::Unconnected if was_active => Verdict::Fatal,
+        StreamState::Unconnected => Verdict::Fatal,
         _ => Verdict::Ignore,
     }
 }
 
+/// Jak często meldować rutynowy błąd sesyjny. Warunek („brak celu", „nieudany
+/// link") jest z natury trwały, a WirePlumber wysyła `sendClientError` przy
+/// KAŻDYM rescanie — bez dławienia zalewamy poziom WARN, na którym widać
+/// jedyny czysty sygnał alarmowy toru RT (przepełnienia ringów).
+const SESSION_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
 fn watch_stream<D>(
     name: &'static str,
+    target_name: &str,
     fatal: &Fatal,
     ml: &pw::main_loop::MainLoopRc,
 ) -> impl FnMut(&pw::stream::Stream, &mut D, StreamState, StreamState) {
     let fatal = fatal.clone();
     let ml = ml.clone();
-    let was_active = Cell::new(false);
+    let target_name = target_name.to_string();
+    let last_warn: Cell<Option<std::time::Instant>> = Cell::new(None);
+    let suppressed = Cell::new(0u64);
+    // ostatni komunikat sesyjny — jedyna konkretna wskazówka, jaką serwer nam
+    // dał, i akurat ta, której brakowało w komunikacie fatalnym
+    let last_session_error = RefCell::new(String::new());
     move |stream, _ud, old, new| {
         log::debug!("{name}: stan {old:?} -> {new:?}");
-        if matches!(new, StreamState::Streaming | StreamState::Paused) {
-            was_active.set(true);
-        }
         let state_is_error = matches!(stream.state(), StreamState::Error(_));
-        match verdict(&new, state_is_error, was_active.get()) {
+        match verdict(&new, state_is_error) {
             Verdict::Ignore => {}
             Verdict::Warn => {
                 let msg = match &new {
                     StreamState::Error(m) => m.as_str(),
                     _ => "",
                 };
-                log::warn!(
-                    "{name}: błąd sesyjny od serwera (zwykle brak celu albo nieudany link), \
-                     stan strumienia bez zmian — pracuję dalej: {msg}"
-                );
+                *last_session_error.borrow_mut() = msg.to_string();
+                let now = std::time::Instant::now();
+                let due = match last_warn.get() {
+                    None => true,
+                    Some(t) => now.duration_since(t) >= SESSION_WARN_INTERVAL,
+                };
+                if due {
+                    let skipped = suppressed.replace(0);
+                    let tail = if skipped > 0 {
+                        format!(" (pominięto {skipped} podobnych w ostatnich {}s)",
+                            SESSION_WARN_INTERVAL.as_secs())
+                    } else {
+                        String::new()
+                    };
+                    log::warn!(
+                        "{name}: błąd sesyjny od serwera przy celu \"{target_name}\" \
+                         (zwykle brak celu albo nieudany link), stan strumienia bez zmian — \
+                         pracuję dalej: {msg}{tail}"
+                    );
+                    last_warn.set(Some(now));
+                } else {
+                    suppressed.set(suppressed.get() + 1);
+                }
             }
             Verdict::Fatal => {
+                let last = last_session_error.borrow();
+                let hint = if last.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Ostatni komunikat serwera: {last}.")
+                };
                 let reason = match &new {
-                    StreamState::Error(m) => format!("{name}: błąd strumienia: {m}"),
+                    StreamState::Error(m) => {
+                        format!("{name}: błąd strumienia (cel \"{target_name}\"): {m}")
+                    }
                     _ => format!(
-                        "{name}: węzeł wypadł z grafu — zerwane połączenie z PipeWire \
-                         albo zniknął cel odtwarzania (strumień ma DONT_RECONNECT)"
+                        "{name}: węzeł wypadł z grafu — cel odtwarzania \"{target_name}\" \
+                         zniknął albo zerwało się połączenie z PipeWire.{hint} \
+                         Co zrobić: włącz to urządzenie i uruchom translator ponownie, \
+                         albo wskaż inne w [audio].output_device \
+                         (lista: nacelle-translator devices)."
                     ),
                 };
+                drop(last);
                 *fatal.borrow_mut() = Some(reason);
                 ml.quit();
             }
@@ -604,8 +774,12 @@ pub fn run_graph(
     let core = context.connect_rc(None)?;
 
     let sinks = enumerate_sinks(&mainloop, &core)?;
-    let default_sink = read_default_sink_name(&mainloop, &core);
+    let (default_sink, default_watch) = read_default_sink_name(&mainloop, &core);
     let target = pick_output(&sinks, output_device, default_sink.as_deref())?;
+    // Od tej chwili podpięcie do metadanych ma co porównywać. `default_watch`
+    // MUSI dożyć końca `run_graph` — jego wcześniejszy drop wypina słuchacza
+    // i zmiana wyjścia w KDE znów staje się niewidoczna.
+    default_watch.set_target(&target.name);
     log::info!(
         "cel odtwarzania: {} ({})",
         target.name,
@@ -651,7 +825,7 @@ pub fn run_graph(
 
     let _sink_listener = sink_stream
         .add_local_listener_with_user_data(sink_state)
-        .state_changed(watch_stream("sink", &fatal, &mainloop))
+        .state_changed(watch_stream("sink", &target.name, &fatal, &mainloop))
         .param_changed(|_stream, _st, id, param| {
             let Some(param) = param else { return };
             if id != spa::param::ParamType::Format.as_raw() {
@@ -738,6 +912,16 @@ pub fn run_graph(
             *pw::keys::MEDIA_CATEGORY => "Playback",
             *pw::keys::NODE_NAME => OUT_NODE_NAME,
             "node.link-group" => "nacelle-translator",
+            // Klucz WirePlumbera (PipeWire go nie zna — `strings
+            // libpipewire-0.3.so.0 | grep dont-` zwraca wyłącznie
+            // `node.dont-reconnect`). Czytany wprost z właściwości węzła
+            // w linking/find-defined-target.lua:38 i decyduje o gałęzi :116-127.
+            // Bez niego `target.object` jest tylko SUGESTIĄ: nietrafione
+            // dopasowanie przechodzi dalej, aż do find-default-target.lua,
+            // czyli do domyślnego sinka — a tym bywa NASZ sink. Z nim serwer
+            // zamiast fallbacku wysyła błąd i niszczy nasz węzeł, co strażnik
+            // `verdict` zamienia w głośne zakończenie z instrukcją.
+            "node.dont-fallback" => "true",
         };
         p.insert(*pw::keys::TARGET_OBJECT, target.name.as_str());
         p
@@ -757,7 +941,7 @@ pub fn run_graph(
 
     let _play_listener = play_stream
         .add_local_listener_with_user_data(play_state)
-        .state_changed(watch_stream("playback", &fatal, &mainloop))
+        .state_changed(watch_stream("playback", &target.name, &fatal, &mainloop))
         .process(|stream, st: &mut PlayState| {
             let Some(mut buf) = stream.dequeue_buffer() else {
                 return;
@@ -904,8 +1088,14 @@ pub fn run_graph(
                 // Etap 1a: czysty pomiar. Ta linia ma dać TWARDĄ liczbę pod
                 // decyzję o regulatorze zaległości i o rozmiarze "prime"
                 // (main.rs) — dziś obie stoją na wyprowadzeniu, nie na pomiarze.
+                //
+                // DEBUG, nie INFO: to przyrząd na sesję pomiarową, a nie
+                // zachowanie domyślne programu. Na INFO byłoby to ~720 linii
+                // na godzinę wpisywanych przez launcher na dysk, bez sposobu
+                // wyłączenia innego niż ucięcie wszystkich INFO. Odsłuch
+                // pomiarowy: uruchom z `-v`.
                 match pass_stats.take() {
-                    Some(s) => log::info!(
+                    Some(s) if s.quantum_frames > 0 => log::debug!(
                         "passthrough: zaległość min {:.1} / max {:.1} / ost. {:.1} ms \
                          (kwant {} ramek = {:.1} ms, {} cykli/{}s)",
                         pass_samples_to_ms(s.min_samples),
@@ -916,9 +1106,26 @@ pub fn run_graph(
                         s.cycles,
                         DROP_REPORT_INTERVAL.as_secs()
                     ),
-                    None => log::info!(
+                    Some(s) => log::debug!(
+                        "passthrough: zaległość min {:.1} / max {:.1} / ost. {:.1} ms \
+                         (kwant NIEZNANY — graf ani razu nie podał `requested`, obowiązuje \
+                         FALLBACK_FRAMES={FALLBACK_FRAMES} ramek; {} cykli/{}s)",
+                        pass_samples_to_ms(s.min_samples),
+                        pass_samples_to_ms(s.max_samples),
+                        pass_samples_to_ms(s.last_samples),
+                        s.cycles,
+                        DROP_REPORT_INTERVAL.as_secs()
+                    ),
+                    // NIE pisz tu „nieprzypięty do sprzętu" — to nieprawda.
+                    // Odlinkowany węzeł DALEJ jest wołany („normally idle nodes
+                    // keep processing", man 7 pipewire-props), a suspend go nie
+                    // dotyka: monitors/suspend-node.lua filtruje `Audio/*`,
+                    // a my mamy `Stream/Output/Audio`. Zerowa liczba cykli
+                    // znaczy zawieszony węzeł albo stojący serwer — utratę celu
+                    // wykrywa `verdict` przez node.dont-fallback, nie ta linia.
+                    None => log::debug!(
                         "passthrough: ani jednego cyklu odtwarzania w ostatnich {}s \
-                         (węzeł uśpiony albo nieprzypięty do sprzętu)",
+                         — węzeł zawieszony albo serwer stanął",
                         DROP_REPORT_INTERVAL.as_secs()
                     ),
                 }
@@ -926,15 +1133,28 @@ pub fn run_graph(
     }
 
     log::info!(
-        "węzeł \"Nacelle Translator (PL)\" gotowy — ustaw go jako wyjście dźwięku \
-         (wpctl set-default albo ustawienia KDE); Ctrl+C kończy"
+        "węzeł \"Nacelle Translator (PL)\" gotowy (node.name={SINK_NODE_NAME}) — skieruj do \
+         niego dźwięk: `wpctl set-default <ID>`, gdzie ID bierzesz z `nacelle-translator \
+         devices`. UWAGA: aplet głośności KDE UKRYWA ten węzeł na liście urządzeń \
+         (node.virtual=true + filterVirtualDevices w plasma-pa), więc w samym aplecie go \
+         nie znajdziesz — działa za to przenoszenie aplikacji w Ustawienia → Dźwięk → \
+         Aplikacje. Ctrl+C kończy"
     );
     mainloop.run();
 
+    // KOLEJNOŚĆ JEST ISTOTNA. `disconnect()` sam wywołuje `state_changed`
+    // z `Unconnected`, a to jest werdykt fatalny (patrz `verdict`) — gdyby
+    // odczyt `fatal` był po rozłączeniu, KAŻDY czysty Ctrl+C kończyłby się
+    // kodem 1 i komunikatem o utracie celu. Dodatkowo `sink` rozłącza się jako
+    // drugi, więc NADPISAŁBY prawdziwą przyczynę zapisaną wcześniej przez
+    // `playback`, maskując realną awarię celu odtwarzania komunikatem o sinku.
+    let fatal_msg = fatal.borrow_mut().take();
+
     play_stream.disconnect()?;
     sink_stream.disconnect()?;
+    drop(default_watch);
 
-    if let Some(msg) = fatal.borrow_mut().take() {
+    if let Some(msg) = fatal_msg {
         bail!(msg);
     }
     Ok(())
@@ -986,24 +1206,28 @@ mod tests {
         // sendClientError od WirePlumbera: zdarzenie Error, ale stream.state()
         // nadal Streaming/Paused — proces ma to przeżyć
         assert_eq!(
-            verdict(&err("no target node available"), false, true),
+            verdict(&err("no target node available"), false),
             Verdict::Warn
         );
-        assert_eq!(verdict(&err("cokolwiek"), false, false), Verdict::Warn);
+        assert_eq!(verdict(&err("target not found"), false), Verdict::Warn);
     }
 
     #[test]
     fn w6_prawdziwy_blad_strumienia_zostaje_fatalny() {
         // pw_stream_set_error: stan strumienia FAKTYCZNIE jest Error
-        assert_eq!(verdict(&err("format rejected"), true, true), Verdict::Fatal);
-        assert_eq!(verdict(&err("no buffers"), true, false), Verdict::Fatal);
+        assert_eq!(verdict(&err("format rejected"), true), Verdict::Fatal);
+        assert_eq!(verdict(&err("no buffers"), true), Verdict::Fatal);
     }
 
     #[test]
-    fn w7_unconnected_fatalny_dopiero_po_aktywnosci() {
-        // przed pierwszym Streaming/Paused Unconnected jest stanem startowym
-        assert_eq!(verdict(&StreamState::Unconnected, false, false), Verdict::Ignore);
-        assert_eq!(verdict(&StreamState::Unconnected, false, true), Verdict::Fatal);
+    fn w7_unconnected_zawsze_fatalny() {
+        // Zdarzenie Unconnected powstaje wyłącznie w proxy_removed /
+        // proxy_destroy / on_core_error(-EPIPE) — a stan początkowy tej samej
+        // nazwy NIE jest emitowany. Bramka „dopiero po Streaming/Paused"
+        // uzależniała przeżycie procesu od wyścigu między sendClientError
+        // a request_destroy przy pierwszym linkowaniu.
+        assert_eq!(verdict(&StreamState::Unconnected, false), Verdict::Fatal);
+        assert_eq!(verdict(&StreamState::Unconnected, true), Verdict::Fatal);
     }
 
     #[test]
@@ -1013,11 +1237,44 @@ mod tests {
             StreamState::Paused,
             StreamState::Streaming,
         ] {
-            assert_eq!(verdict(&s, false, true), Verdict::Ignore, "{s:?}");
+            assert_eq!(verdict(&s, false), Verdict::Ignore, "{s:?}");
             // nawet gdy stream.state() zdąży już pokazać Error, samo przejście
             // w stan roboczy nie jest powodem do zabijania procesu
-            assert_eq!(verdict(&s, true, true), Verdict::Ignore, "{s:?}");
+            assert_eq!(verdict(&s, true), Verdict::Ignore, "{s:?}");
         }
+    }
+
+    #[test]
+    fn w9_kwant_zero_nie_udaje_pomiaru() {
+        // adapter bez sugestii kwantu (req=0) NIE może wygrać z realnym
+        // pomiarem tylko dlatego, że wypadł ostatni w oknie
+        let s = PassStats::new();
+        s.observe(2048, 1024);
+        s.observe(2048, 0);
+        let snap = s.take().unwrap();
+        assert_eq!(snap.quantum_frames, 1024);
+    }
+
+    #[test]
+    fn w10_kwant_nieznany_gdy_graf_nigdy_go_nie_podal() {
+        let s = PassStats::new();
+        s.observe(512, 0);
+        s.observe(512, 0);
+        let snap = s.take().unwrap();
+        // 0 = „nie wiem", a wydruk ma to nazwać wprost, zamiast pokazywać
+        // „kwant 0 ramek = 0.0 ms" jako zmierzoną liczbę
+        assert_eq!(snap.quantum_frames, 0);
+        assert_eq!(snap.cycles, 2);
+    }
+
+    #[test]
+    fn w11_kwant_nalezy_do_okna() {
+        let s = PassStats::new();
+        s.observe(100, 2048);
+        s.take().unwrap();
+        s.observe(100, 0);
+        // nowe okno nie może odziedziczyć kwantu po poprzednim
+        assert_eq!(s.take().unwrap().quantum_frames, 0);
     }
 
     #[test]
