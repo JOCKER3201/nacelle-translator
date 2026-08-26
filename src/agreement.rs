@@ -120,6 +120,10 @@ pub struct FinalEmit {
     /// dopasowanie kotwicy nie powiodło się — emisja od pozycji licznikowej
     /// minus k (świadomy duplikat); wywołujący loguje re-kotwiczenie
     pub reanchored: bool,
+    /// generacje finalu miały scommitowane fragmenty — commit to obietnica
+    /// dostarczenia, więc wywołujący NIE może porzucić ogona bramką
+    /// skip_target_lang (rozjazd lock vs detekcja finalu = duplikat, nie ubytek)
+    pub had_commits: bool,
 }
 
 pub struct SpeculativeTracker {
@@ -169,6 +173,75 @@ impl SpeculativeTracker {
         gen < self.min_gen
     }
 
+    /// Czy któraś generacja z zakresu [gen_oldest, gen] ma scommitowane
+    /// fragmenty — tani odczyt dla bramek w stt_thread (wiek/filtr): final
+    /// domykający commity ma obowiązek dostarczenia ogona, nie wolno go
+    /// porzucić hurtem.
+    pub fn has_commits(&self, gen_oldest: u64, gen: u64) -> bool {
+        self.committed > 0 && self.gen.is_some_and(|g| gen_oldest <= g && g <= gen)
+    }
+
+    /// Kotwica trafia DOKŁADNIE na pozycji licznikowej (dist=0) — zero dryfu,
+    /// emisja pozycyjna bez przeszukiwania. Długość kotwicy bierzemy z tailu,
+    /// nie z licznika: resync w dół może zepchnąć licznik poniżej długości
+    /// tailu, a kotwica to zawsze OSTATNIE wyemitowane słowa w komplecie.
+    fn anchor_exact_at(&self, words: &[Word]) -> bool {
+        let m = self.committed_tail.len();
+        if m == 0 || self.committed < m {
+            return false;
+        }
+        let base = self.committed - m;
+        base + m <= words.len()
+            && words[base..base + m]
+                .iter()
+                .zip(self.committed_tail.iter())
+                .all(|(w, a)| w.norm == *a)
+    }
+
+    /// Szuka kotwicy (committed_tail) w `words[w_lo..w_hi]` (starty okien);
+    /// zwraca pozycję ZA dopasowanym oknem = pierwsze niewyemitowane słowo.
+    /// Przy WIELU kandydatach wygrywa NAJWCZEŚNIEJSZY start (duplikat, nie
+    /// ubytek). Oprócz okna długości m próbujemy też m−1: rewizja scalająca
+    /// słowa WEWNĄTRZ kotwicy ("it is"→"it's") skraca ją w nowej hipotezie
+    /// o słowo, a sztywne okno m dolicza wtedy zbędną edycję za doklejone
+    /// obce słowo i dopasowanie przepada mimo realnej zgody.
+    fn find_anchor(&self, words: &[Word], w_lo: usize, w_hi: usize) -> Option<usize> {
+        let m = self.committed_tail.len();
+        let anchor: Vec<&str> = self.committed_tail.iter().map(|s| s.as_str()).collect();
+        let tol = if m >= ANCHOR_M { 2 } else { 1 };
+        for w in w_lo..w_hi.min(words.len()) {
+            for len in [m, m.saturating_sub(1)] {
+                if len == 0 {
+                    continue;
+                }
+                let win: Vec<&str> = words[w..(w + len).min(words.len())]
+                    .iter()
+                    .map(|x| x.norm.as_str())
+                    .collect();
+                if levenshtein_words(&anchor, &win) <= tol {
+                    return Some(w + len);
+                }
+            }
+        }
+        None
+    }
+
+    /// M3 dla przebiegów częściowych: committed jest licznikiem w jednostkach
+    /// pozycji hipotezy Z CHWILI COMMITU — weryfikacja kotwicy na BIEŻĄCEJ
+    /// hipotezie zwraca licznik w jej jednostkach (dokładne trafienie
+    /// pozycyjne wygrywa; inaczej najwcześniejsze okno w ±k). None = kotwica
+    /// nieodnaleziona: emisję w tym przebiegu trzeba pominąć.
+    fn resync_committed(&self) -> Option<usize> {
+        if self.anchor_exact_at(&self.last_words) {
+            return Some(self.committed);
+        }
+        let base = self.committed.saturating_sub(self.committed_tail.len());
+        let w_lo = base.saturating_sub(ANCHOR_K);
+        let w_hi = base + ANCHOR_K + 1;
+        self.find_anchor(&self.last_words, w_lo, w_hi)
+            .map(|e| e.min(self.last_words.len()))
+    }
+
     pub fn locked_lang(&self) -> Option<&str> {
         self.locked_lang.as_deref()
     }
@@ -206,6 +279,28 @@ impl SpeculativeTracker {
         // pierwszy przebieg tej generacji — nie ma z czym się zgodzić
         let prev = prev?;
 
+        // Rewizja whispera zmniejszająca liczbę słów przed granicą commitu
+        // ("it is"→"it's", znikające słowo-halucynacja) przesuwa indeksy
+        // w lewo i emisja pozycyjna od last_words[committed] przeskoczyłaby
+        // prawdziwe, nigdy niewyemitowane słowo. Przed emisją weryfikujemy
+        // kotwicę (jak w on_final) i resynchronizujemy licznik do bieżącej
+        // hipotezy; brak dopasowania = pominięcie emisji w TYM przebiegu
+        // (bezpieczne — nic nie ginie, ogon załatwi kotwica finalu). Resync
+        // ogranicza przy okazji skumulowany dryf licznika między commitami.
+        if self.committed > 0 {
+            match self.resync_committed() {
+                Some(c) if c != self.committed => {
+                    log::debug!(
+                        "spekulacja: gen {gen} resync licznika {} → {c} po rewizji hipotezy",
+                        self.committed
+                    );
+                    self.committed = c;
+                }
+                Some(_) => {}
+                None => return None,
+            }
+        }
+
         // LCP na znormalizowanych słowach (LocalAgreement-2): stabilne jest
         // to, co dwa kolejne przebiegi napisały tak samo
         let lcp = prev
@@ -242,8 +337,8 @@ impl SpeculativeTracker {
         })
     }
 
-    /// Wywołać WYŁĄCZNIE po tym, jak mt_tx.send(fragment) zwrócił Ok (M2) —
-    /// commit to obietnica dostarczenia.
+    /// Wywołać WYŁĄCZNIE po udanym umieszczeniu fragmentu w kanale mt
+    /// (try_send zwrócił Ok) — commit to obietnica dostarczenia (M2).
     pub fn commit(&mut self, p: &PendingFragment) {
         for w in &self.last_words[self.committed..p.new_committed] {
             if self.committed_tail.len() == ANCHOR_M {
@@ -257,60 +352,83 @@ impl SpeculativeTracker {
 
     /// Wynik przebiegu finalnego: wyznacza niewyemitowany ogon dopasowaniem
     /// POZYCYJNYM (M3), resetuje stan segmentu i przesuwa min_gen na gen+1.
+    /// `gen_oldest`: NAJSTARSZA generacja sklejki (koalescencja w stt_thread
+    /// dokleja starsze segmenty z PRZODU i raportuje najnowszą gen) — commity
+    /// trackera dla którejkolwiek gen z [gen_oldest, gen] dotyczą audio
+    /// zawartego w tym finale, więc deduplikujemy je kotwicą zamiast
+    /// re-emitować hurtem.
     /// `coalesced`: ile segmentów skleiła koalescencja w stt_thread.
     /// `raw`: tekst finalu PO deduplikacji szwu.
-    pub fn on_final(&mut self, gen: u64, coalesced: usize, raw: &str) -> FinalEmit {
-        // gen niezgodna = commity dotyczyły INNEGO audio, pełna emisja
-        // niczego nie duplikuje; brak commitów = nie ma czego odejmować
-        if self.gen != Some(gen) || self.committed == 0 {
+    pub fn on_final(&mut self, gen: u64, gen_oldest: u64, coalesced: usize, raw: &str) -> FinalEmit {
+        let same_audio = self.gen.is_some_and(|g| gen_oldest <= g && g <= gen);
+        // gen spoza sklejki = commity dotyczyły INNEGO audio (np. segment
+        // zgubiony na pełnym seg_tx), pełna emisja niczego nie duplikuje;
+        // brak commitów = nie ma czego odejmować
+        if !same_audio || self.committed == 0 {
+            if !same_audio && self.committed > 0 {
+                self.lost_tails += 1;
+                log::warn!(
+                    "spekulacja: gen {} porzucona z {} scommitowanymi słowami — final \
+                     innych generacji [{gen_oldest}..{gen}] (strat łącznie: {})",
+                    self.gen.unwrap_or(0),
+                    self.committed,
+                    self.lost_tails
+                );
+            }
             self.min_gen = self.min_gen.max(gen + 1);
             self.reset_to(None);
             return FinalEmit {
                 text: raw.trim().to_string(),
                 char_share: 1.0,
                 reanchored: false,
+                had_commits: false,
             };
         }
 
         let f = tokenize(raw);
         let c = self.committed;
-        let m = ANCHOR_M.min(c);
-        let anchor: Vec<&str> = self.committed_tail.iter().map(|s| s.as_str()).collect();
-        debug_assert_eq!(anchor.len(), m); // tail trzyma min(committed, ANCHOR_M) norm
-
-        // M3: zakres startów okna — kotwica licznikowa ±k (okno absorbuje
-        // też przesunięcie o 1 słowo po deduplikacji szwu); przy koalescencji
-        // starsze segmenty doklejone PRZED audio tej generacji unieważniają
-        // licznik pozycyjny, więc okno rozszerzamy na całą listę
-        // (rozszerzenie reguły "brak dopasowania → duplikat, nie ubytek")
-        let (w_lo, w_hi) = if coalesced == 1 {
-            let base = c - m;
-            (base.saturating_sub(ANCHOR_K), (base + ANCHOR_K + 1).min(f.len()))
+        // licznik pozycyjny jest w jednostkach hipotez częściowych TEJ
+        // generacji — ważny tylko bez sklejki (starsze segmenty doklejone
+        // z przodu przesuwają wszystko w prawo)
+        let counter_valid = coalesced == 1 && self.gen == Some(gen);
+        let mut reanchored = false;
+        let start = if counter_valid && self.anchor_exact_at(&f) {
+            c // dokładne trafienie pozycyjne — zero dryfu
         } else {
-            (0, f.len())
-        };
-        let tol = if m >= ANCHOR_M { 2 } else { 1 };
-
-        let mut matched = None;
-        for w in w_lo..w_hi {
-            let win: Vec<&str> = f[w..(w + m).min(f.len())]
-                .iter()
-                .map(|x| x.norm.as_str())
-                .collect();
-            if levenshtein_words(&anchor, &win) <= tol {
-                // przy WIELU kandydatach ZAWSZE najwcześniejszy — gwarancja
-                // duplikacji, nie ubytku
-                matched = Some(w + m);
-                break;
-            }
-        }
-        let (start, reanchored) = match matched {
-            Some(s) => (s, false),
-            None => {
-                // brak dopasowania: emisja od pozycji licznikowej minus k —
-                // świadomy duplikat zamiast ryzyka ubytku
-                self.reanchors += 1;
-                (c.saturating_sub(ANCHOR_K), true)
+            let base = c.saturating_sub(self.committed_tail.len());
+            let matched = if counter_valid {
+                // M3: okno licznikowe ±k (absorbuje też przesunięcie o 1
+                // słowo po deduplikacji szwu)
+                self.find_anchor(&f, base.saturating_sub(ANCHOR_K), base + ANCHOR_K + 1)
+                    .or_else(|| {
+                        // dryf licznika ponad ±k (skumulowane rewizje
+                        // zmniejszające liczbę słów przed granicą): zanim
+                        // spadniemy na fallback licznikowy, przeszukujemy
+                        // kotwicą CAŁĄ listę — najwcześniejsze dopasowanie
+                        // to duplikat, nie ubytek
+                        let full = self.find_anchor(&f, 0, f.len());
+                        if full.is_some() {
+                            log::info!(
+                                "spekulacja: gen {gen} kotwica poza oknem ±k — \
+                                 dopasowana pełną listą (dryf licznika)"
+                            );
+                        }
+                        full
+                    })
+            } else {
+                // sklejka / commity starszej gen: licznik nieważny — od razu
+                // cała lista, najwcześniejsze dopasowanie
+                self.find_anchor(&f, 0, f.len())
+            };
+            match matched {
+                Some(e) => e,
+                None => {
+                    // brak dopasowania: emisja od pozycji licznikowej minus
+                    // k — świadomy duplikat zamiast ryzyka ubytku
+                    self.reanchors += 1;
+                    reanchored = true;
+                    c.saturating_sub(ANCHOR_K)
+                }
             }
         };
 
@@ -333,18 +451,20 @@ impl SpeculativeTracker {
             text,
             char_share,
             reanchored,
+            had_commits: true,
         }
     }
 
-    /// Final istniał, ale nie będzie emitowany (odrzucony przez filtr /
-    /// budżet wieku / błąd whispera) — sam reset i przesunięcie min_gen;
+    /// Final istniał, ale nie będzie emitowany (odrzucony przez budżet wieku /
+    /// błąd whispera / pusty tekst) — sam reset i przesunięcie min_gen;
     /// scommitowany ogon przepada (strata zaakceptowana świadomie).
-    pub fn on_final_rejected(&mut self, gen: u64) {
-        if self.gen == Some(gen) && self.committed > 0 {
+    /// `gen_oldest`..`gen`: zakres generacji sklejki, jak w on_final.
+    pub fn on_final_rejected(&mut self, gen_oldest: u64, gen: u64) {
+        if self.committed > 0 && self.gen.is_some_and(|g| gen_oldest <= g && g <= gen) {
             self.lost_tails += 1;
             log::warn!(
-                "spekulacja: gen {gen} — final odrzucony po {} scommitowanych słowach, \
-                 ogon przepadł (strat łącznie: {})",
+                "spekulacja: gen [{gen_oldest}..{gen}] — final odrzucony po {} scommitowanych \
+                 słowach, ogon przepadł (strat łącznie: {})",
                 self.committed,
                 self.lost_tails
             );
@@ -472,8 +592,9 @@ mod tests {
     fn t5_ogon_z_rewizja() {
         let mut tr = committed_abcd(7);
         tr.lock_lang("en");
-        let emit = tr.on_final(7, 1, "alpha bravo charlie delta, revised tail here.");
+        let emit = tr.on_final(7, 7, 1, "alpha bravo charlie delta, revised tail here.");
         assert!(!emit.reanchored);
+        assert!(emit.had_commits);
         assert_eq!(emit.text, "revised tail here.");
         assert_eq!(tr.reanchors, 0);
         // M5: lock per segment — final resetuje
@@ -486,7 +607,7 @@ mod tests {
     #[test]
     fn t6_brak_dopasowania_duplikat() {
         let mut tr = committed_abcd(1);
-        let emit = tr.on_final(1, 1, "zulu yankee xray whiskey victor uniform tango sierra");
+        let emit = tr.on_final(1, 1, 1, "zulu yankee xray whiskey victor uniform tango sierra");
         assert!(emit.reanchored);
         assert_eq!(tr.reanchors, 1);
         // start = committed(4) − k(3) = 1 → emisja od "yankee"
@@ -543,6 +664,7 @@ mod tests {
         let mut tr = committed_abcd(3);
         let emit = tr.on_final(
             3,
+            3,
             2,
             "alpha bravo charlie delta one two alpha bravo charlie delta end",
         );
@@ -556,8 +678,9 @@ mod tests {
     fn t11_stale_gen() {
         let mut tr = tracker();
         assert!(tr.on_partial(3, "one two, three").is_none());
-        let emit = tr.on_final(3, 1, "one two, three");
+        let emit = tr.on_final(3, 3, 1, "one two, three");
         assert_eq!(emit.text, "one two, three"); // committed==0 → pełna emisja
+        assert!(!emit.had_commits);
         assert!(tr.is_stale(3));
         assert!(!tr.is_stale(4));
         // spóźniona migawka gen 3: None i zero skutków ubocznych
@@ -574,7 +697,7 @@ mod tests {
     #[test]
     fn t12_final_krotszy_niz_committed() {
         let mut tr = committed_abcd(9);
-        let emit = tr.on_final(9, 1, "alpha bravo");
+        let emit = tr.on_final(9, 9, 1, "alpha bravo");
         assert_eq!(emit.text, "");
         assert_eq!(emit.char_share, 0.0);
     }
@@ -589,5 +712,115 @@ mod tests {
             .expect("fragment z diakrytykami");
         assert_eq!(frag.text, "Zażółć gęślą jaźń,");
         assert_eq!(frag.new_committed, 3);
+    }
+
+    // T14: rewizja SCALAJĄCA słowa przed granicą commitu ("it is"→"it's")
+    // przesuwa indeksy w lewo — bez resyncu emisja pozycyjna przeskoczyłaby
+    // "and" (bezwrotny ubytek); z resynciem "and" wychodzi we fragmencie
+    #[test]
+    fn t14_rewizja_scalajaca_resynchronizuje() {
+        let mut tr = tracker();
+        assert!(tr.on_partial(1, "I think it is red, and then").is_none());
+        let frag = tr
+            .on_partial(1, "I think it is red, and then we")
+            .expect("commit prefiksu w starej formie");
+        assert_eq!(frag.text, "I think it is red,");
+        assert_eq!(frag.new_committed, 5);
+        tr.commit(&frag);
+        // rewizja scalona: jedno słowo mniej przed granicą; resync 5 → 4,
+        // LCP ze starą hipotezą za mały na emisję
+        assert!(tr.on_partial(1, "I think it's red, and then we go").is_none());
+        // brak interpunkcji frazowej w stabilnej części ("home." poza LCP)
+        assert!(tr
+            .on_partial(1, "I think it's red, and then we go home.")
+            .is_none());
+        let frag = tr
+            .on_partial(1, "I think it's red, and then we go home.")
+            .expect("dwa zgodne przebiegi w nowej formie");
+        // emisja MUSI zacząć się od "and" — pierwszego niewyemitowanego słowa
+        assert_eq!(frag.text, "and then we go home.");
+        tr.commit(&frag);
+        let emit = tr.on_final(1, 1, 1, "I think it's red, and then we go home.");
+        assert!(!emit.reanchored);
+        assert_eq!(emit.text, ""); // final w całości pokryty fragmentami
+    }
+
+    // T15: skumulowany dryf licznika ponad ANCHOR_K — okno ±k chybia, ale
+    // przeszukanie CAŁEJ listy finalu ratuje ogon (stary fallback c−k
+    // wypadał poza listę i gubił go w całości)
+    #[test]
+    fn t15_dryf_ponad_k_pelna_lista() {
+        let mut tr = tracker();
+        let base = "one two three four five six seven eight nine ten eleven twelve,";
+        assert!(tr.on_partial(1, base).is_none());
+        let frag = tr
+            .on_partial(1, &format!("{base} tail"))
+            .expect("commit 12 słów");
+        assert_eq!(frag.new_committed, 12);
+        tr.commit(&frag);
+        // final widzi scommitowaną treść tylko jako 4 słowa na początku —
+        // pozycja kotwicy (0) daleko poza oknem [base−k, base+k]
+        let emit = tr.on_final(1, 1, 1, "nine ten eleven twelve, real tail here.");
+        assert!(!emit.reanchored);
+        assert_eq!(emit.text, "real tail here.");
+        assert_eq!(tr.reanchors, 0);
+    }
+
+    // T16: final SKLEJKI niosący nowszą gen niż commity trackera (typowy
+    // przypadek koalescencji pod zaległością) — zakres [gen_oldest, gen]
+    // traktowany jako to samo audio: scommitowane słowa deduplikowane
+    // kotwicą zamiast re-emisji hurtem
+    #[test]
+    fn t16_final_sklejki_nowszej_gen_deduplikuje() {
+        let mut tr = committed_abcd(5);
+        let emit = tr.on_final(
+            6,
+            5,
+            2,
+            "alpha bravo charlie delta, echo fox. next utterance here.",
+        );
+        assert!(!emit.reanchored);
+        assert!(emit.had_commits);
+        assert_eq!(emit.text, "echo fox. next utterance here.");
+        assert!(tr.is_stale(6));
+    }
+
+    // T16b: final generacji SPOZA zakresu sklejki — commity dotyczyły innego
+    // audio: pełna emisja, strata ogona policzona
+    #[test]
+    fn t16b_final_spoza_zakresu_pelna_emisja() {
+        let mut tr = committed_abcd(5);
+        let emit = tr.on_final(7, 7, 1, "totally new segment text.");
+        assert!(!emit.had_commits);
+        assert_eq!(emit.text, "totally new segment text.");
+        assert_eq!(tr.lost_tails, 1);
+    }
+
+    // T17: has_commits — tani odczyt dla bramek stt_thread, honoruje zakres
+    // generacji sklejki
+    #[test]
+    fn t17_has_commits_zakres() {
+        let tr = tracker();
+        assert!(!tr.has_commits(1, 1));
+        let tr = committed_abcd(5);
+        assert!(tr.has_commits(5, 5));
+        assert!(tr.has_commits(4, 6)); // sklejka obejmująca gen 5
+        assert!(!tr.has_commits(6, 7)); // commity spoza zakresu
+    }
+
+    // T18: hipoteza całkowicie przepisana po commicie — kotwica nie do
+    // odnalezienia: ŻADNEJ emisji pozycyjnej (mogłaby przeskoczyć prawdziwe
+    // słowa); ogon załatwia final (tu: fallback licznikowy c−k z duplikatem)
+    #[test]
+    fn t18_rewizja_bez_kotwicy_wstrzymuje_emisje() {
+        let mut tr = committed_abcd(2);
+        assert!(tr.on_partial(2, "totally different words here, more").is_none());
+        assert!(tr
+            .on_partial(2, "totally different words here, more still")
+            .is_none());
+        let emit = tr.on_final(2, 2, 1, "totally different words here, more still.");
+        assert!(emit.reanchored);
+        // start = committed(4) − k(3) = 1 → duplikat, nigdy ubytek
+        assert_eq!(emit.text, "different words here, more still.");
     }
 }

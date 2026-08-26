@@ -49,8 +49,15 @@ struct SttJob {
     /// szwu w stt_thread
     forced: bool,
     /// generacja segmentera (vad.rs) — spina final z migawkami spekulacyjnego
-    /// STT pobranymi z tego samego bufora audio
+    /// STT pobranymi z tego samego bufora audio; po koalescencji NAJNOWSZA
+    /// generacja sklejki
     gen: u64,
+    /// NAJSTARSZA generacja sklejki (== gen bez koalescencji) — tracker
+    /// commitów mógł zatrzymać się na starszej gen (finale mają priorytet,
+    /// więc pod zaległością partiale nowszej gen się nie przetwarzają);
+    /// zakres [gen_oldest, gen] mówi mu, że commity dotyczą TEGO audio
+    /// i deduplikują się kotwicą zamiast re-emisji hurtem
+    gen_oldest: u64,
 }
 
 /// Migawka OTWARTEGO segmentu do przebiegu częściowego whispera
@@ -323,6 +330,7 @@ fn segmenter_thread(
                     coalesced: 1,
                     forced: utt.forced,
                     gen: utt.gen,
+                    gen_oldest: utt.gen,
                 };
                 if seg_tx.try_send(job).is_err() {
                     dropped += 1;
@@ -423,7 +431,9 @@ fn stt_thread(
                     job.coalesced += next.coalesced;
                     job.forced = next.forced;
                     // najnowsza generacja — spójne z min_gen = gen+1 po
-                    // finale, bo starsze generacje też są już domknięte
+                    // finale, bo starsze generacje też są już domknięte;
+                    // gen_oldest zostaje — tracker deduplikuje commity
+                    // starszej gen kotwicą po całym zakresie sklejki
                     job.gen = next.gen;
                 }
                 Err(_) => break,
@@ -434,7 +444,14 @@ fn stt_thread(
         }
 
         let age = job.created.elapsed();
-        if age > MAX_JOB_AGE {
+        // final generacji ze scommitowanymi fragmentami jest ZWOLNIONY
+        // z budżetu wieku i z filtra halucynacji: commit to obietnica
+        // dostarczenia — ogon domyka zdanie, którego początek lektor już
+        // przeczytał, a zaległość jest częściowo samozawiniona (dodatkowe
+        // przebiegi GPU + ruch MT spekulacji); koszt transkrypcji ograniczony
+        let committed_final =
+            stt_cfg.speculative && tracker.has_commits(job.gen_oldest, job.gen);
+        if age > MAX_JOB_AGE && !committed_final {
             log::warn!(
                 "#{} pominięty przed transkrypcją — zaległość {:.1}s przekracza budżet {}s",
                 job.id,
@@ -444,7 +461,7 @@ fn stt_thread(
             // final porzucony: tracker musi domknąć generację (scommitowany
             // ogon przepada — strata liczona i logowana w trackerze)
             if stt_cfg.speculative {
-                tracker.on_final_rejected(job.gen);
+                tracker.on_final_rejected(job.gen_oldest, job.gen);
             }
             continue;
         }
@@ -456,7 +473,7 @@ fn stt_thread(
             Err(e) => {
                 log::error!("#{} whisper: {e:#}", job.id);
                 if stt_cfg.speculative {
-                    tracker.on_final_rejected(job.gen);
+                    tracker.on_final_rejected(job.gen_oldest, job.gen);
                 }
                 continue;
             }
@@ -464,22 +481,35 @@ fn stt_thread(
         let ms = t0.elapsed().as_millis();
 
         if let Some(reason) = filter.reject_reason(&t) {
-            // warn, nie debug: bez tego odrzucenia znikały bez śladu na
-            // domyślnym poziomie logu i wyglądało to, jakby program
-            // "nic nie robił", mimo że whisper realnie transkrybował
-            log::warn!(
-                "#{} odrzucone — {reason}: \"{}\" ({secs:.1}s audio, no_speech {:.2}, logprob {:.2})",
-                job.id,
-                t.text,
-                t.no_speech_prob,
-                t.avg_logprob
-            );
-            // M4: filtr działa na finalach jak dotąd (fragmenty go nie
-            // widzą); odrzucony final i tak domyka generację w trackerze
-            if stt_cfg.speculative {
-                tracker.on_final_rejected(job.gen);
+            if committed_final && !t.text.is_empty() {
+                // final z commitami: odrzucenie hurtem byłoby ubytkiem ogona
+                // zdania, którego początek dwa przebiegi częściowe już
+                // potwierdziły i lektor przeczytał (typowy false positive:
+                // dedup last_seen na legalnie powtórzonej frazie) — ogon
+                // zostanie dostarczony, powód tylko logujemy
+                log::warn!(
+                    "#{} filtr zgłasza \"{reason}\", ale generacja ma scommitowane \
+                     fragmenty — dostarczam ogon mimo to",
+                    job.id
+                );
+            } else {
+                // warn, nie debug: bez tego odrzucenia znikały bez śladu na
+                // domyślnym poziomie logu i wyglądało to, jakby program
+                // "nic nie robił", mimo że whisper realnie transkrybował
+                log::warn!(
+                    "#{} odrzucone — {reason}: \"{}\" ({secs:.1}s audio, no_speech {:.2}, logprob {:.2})",
+                    job.id,
+                    t.text,
+                    t.no_speech_prob,
+                    t.avg_logprob
+                );
+                // M4: filtr działa na finalach jak dotąd (fragmenty go nie
+                // widzą); odrzucony final i tak domyka generację w trackerze
+                if stt_cfg.speculative {
+                    tracker.on_final_rejected(job.gen_oldest, job.gen);
+                }
+                continue;
             }
-            continue;
         }
         // Deduplikacja szwu: po cięciu wymuszonym nakładka 250 ms powiela
         // ostatnie słowo poprzedniego segmentu ("...but until" → "Until we...").
@@ -506,7 +536,7 @@ fn stt_thread(
         if t.text.is_empty() {
             prev_seam = None;
             if stt_cfg.speculative {
-                tracker.on_final_rejected(job.gen);
+                tracker.on_final_rejected(job.gen_oldest, job.gen);
             }
             continue;
         }
@@ -533,8 +563,10 @@ fn stt_thread(
 
         // M3: ogon finalu — on_final MUSI pobiec przed decyzją skip niżej,
         // bo reset generacji w trackerze jest potrzebny niezależnie od niej
-        let (text, orig_secs) = if stt_cfg.speculative {
-            let emit = tracker.on_final(job.gen, job.coalesced, &t.text);
+        let (text, orig_secs, mt_lang, had_commits) = if stt_cfg.speculative {
+            // lock trzeba odczytać PRZED on_final — reset segmentu go czyści
+            let locked = tracker.locked_lang().map(str::to_string);
+            let emit = tracker.on_final(job.gen, job.gen_oldest, job.coalesced, &t.text);
             if emit.reanchored {
                 log::warn!(
                     "#{} re-kotwiczenie ogona finalu — emisja z duplikatem (łącznie: {})",
@@ -546,22 +578,43 @@ fn stt_thread(
                 log::info!("#{} final w całości pokryty fragmentami", job.id);
                 continue;
             }
-            (emit.text, secs * emit.char_share)
+            // ogon segmentu z commitami idzie w języku ZAMROŻONYM: fragmenty
+            // przetłumaczono z tego języka, a spójność wewnątrz zdania jest
+            // ważniejsza niż detekcja finalu (flap detekcji częściowy/pełny
+            // bufor to dokładnie to, przed czym lang_lock chroni)
+            let lang = match (emit.had_commits, locked) {
+                (true, Some(l)) => l,
+                _ => t.lang.clone(),
+            };
+            (emit.text, secs * emit.char_share, lang, emit.had_commits)
         } else {
-            (t.text, secs)
+            (t.text, secs, t.lang.clone(), false)
         };
 
         // M5: skip_target_lang decydowany WYŁĄCZNIE na finale (fragmenty
-        // w języku docelowym są wstrzymywane bez decyzji — handle_partial)
+        // w języku docelowym są wstrzymywane bez decyzji — handle_partial).
+        // Wyjątek: gdy fragmenty JUŻ wyszły (lock zamroził język nie-docelowy),
+        // rozjazd lock vs detekcja finalu rozstrzygamy w stronę DOSTARCZENIA
+        // ogona — słuchacz usłyszał początek zdania, urwanie reszty byłoby
+        // ubytkiem (zasada nadrzędna: duplikat/nadmiar, nigdy ubytek)
         if mt_cfg.skip_target_lang && t.lang == mt_cfg.target_lang_code {
-            log::info!("#{} już w języku docelowym — pomijam", job.id);
-            continue;
+            if had_commits {
+                log::warn!(
+                    "#{} rozjazd lang_lock ({mt_lang}) vs detekcja finalu ({}) — \
+                     fragmenty już wyszły, dostarczam ogon mimo języka docelowego",
+                    job.id,
+                    t.lang
+                );
+            } else {
+                log::info!("#{} już w języku docelowym — pomijam", job.id);
+                continue;
+            }
         }
         let _ = mt_tx.send(MtJob {
             id: job.id,
             created: job.created,
             text,
-            lang: t.lang,
+            lang: mt_lang,
             orig_secs,
             kind: JobKind::FinalTail,
         });
@@ -671,16 +724,32 @@ fn handle_partial(
                 idx: frag.idx,
             },
         };
-        // send blokujący: Ok = fragment JEST w kanale — dopiero wtedy wolno
-        // przesunąć committed (M2); commit to obietnica dostarczenia
-        if mt_tx.send(mjob).is_ok() {
-            log::info!(
-                "#{}.{} fragment ({n_words} słów): \"{}\"",
-                p.gen,
-                frag.idx,
-                frag.text
-            );
-            tracker.commit(&frag);
+        // try_send zamiast send blokującego: pełny kanał mt (wolny translator)
+        // zawieszałby wątek STT na pełną latencję tłumaczenia, finale
+        // starzałyby się w seg_rx ponad MAX_JOB_AGE i spekulacja gubiłaby
+        // WIĘCEJ niż ścieżka wsadowa. Porzucenie NIEscommitowanego fragmentu
+        // jest legalne — tracker zaproponuje identyczny przy następnym
+        // przebiegu (idempotencja: test T9). Niezmiennik M2 zachowany:
+        // committed przesuwamy wyłącznie po udanym umieszczeniu w kanale.
+        match mt_tx.try_send(mjob) {
+            Ok(()) => {
+                log::info!(
+                    "#{}.{} fragment ({n_words} słów): \"{}\"",
+                    p.gen,
+                    frag.idx,
+                    frag.text
+                );
+                tracker.commit(&frag);
+            }
+            Err(chan::TrySendError::Full(_)) => {
+                log::debug!(
+                    "#{}.{} kanał mt pełny — fragment nie scommitowany, wróci \
+                     w następnym przebiegu",
+                    p.gen,
+                    frag.idx
+                );
+            }
+            Err(chan::TrySendError::Disconnected(_)) => {}
         }
     }
 }
