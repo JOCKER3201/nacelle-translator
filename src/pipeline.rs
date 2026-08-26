@@ -912,6 +912,17 @@ fn synth_with_restart(
 /// 10 s to 5x margines nad najdłuższą znaną legalną blokadą po stronie
 /// WirePlumbera (2000 ms blokady rescanu po zniknięciu węzła bluez5,
 /// linking/rescan.lua).
+///
+/// ZAKRES — CZEGO TEN ZATRZASK **NIE** ŁAPIE. Chroni przed ZATRZYMANIEM
+/// ZEGARA GRAFU: zawieszony serwer PipeWire, freewheeling, węzeł uśpiony
+/// z zewnątrz. NIE chroni przed utratą celu odtwarzania. Odlinkowany węzeł
+/// dalej dostaje `process()` („normally idle nodes keep processing",
+/// man 7 pipewire-props; monitors/suspend-node.lua filtruje `Audio/*`, więc
+/// naszego `Stream/Output/Audio` nie usypia), więc ring DALEJ się drenuje,
+/// `push_slice` dalej zwraca `n > 0` i zatrzask nigdy nie zadziała — mowa
+/// lektora jest wtedy po cichu zjadana przez węzeł grający w próżnię.
+/// Utratę celu wykrywa `node.dont-fallback` + strażnik `verdict` w pw.rs,
+/// i to jest jedyne miejsce, które ją wykrywa.
 const TTS_PUSH_STALL_BUDGET: Duration = Duration::from_secs(10);
 /// Jak często meldować o porzucaniu, dopóki zatrzask trwa (jeden zbiorczy
 /// komunikat zamiast jednego na każdy klip).
@@ -980,7 +991,9 @@ fn tts_thread(
 
     // księgowość porzuceń jak w translate_thread — ostatnia bramka przed
     // głośnikiem, więc jej licznik jest najbliższym odpowiednikiem „ile treści
-    // realnie nie usłyszał słuchacz"
+    // realnie nie usłyszał słuchacz". Liczy OBIE drogi porzucenia: budżet
+    // wieku (MAX_JOB_AGE) i zatrzask zatrzymanego odtwarzania. Sumaryczny,
+    // nigdy nie zerowany.
     let mut dropped_finals: u64 = 0;
 
     // zatrzask „odtwarzanie stoi" — patrz `stall_decision`
@@ -995,7 +1008,11 @@ fn tts_thread(
         let age = job.created.elapsed();
         // M2: fragmenty spekulacyjne zwolnione z budżetu porzucania — commit
         // to obietnica dostarczenia; tryb doganiania niżej dalej działa
-        // (przyspiesza odczyt, niczego nie porzuca)
+        // (przyspiesza odczyt, niczego nie porzuca).
+        // GRANICA TEJ OBIETNICY: zwolnienie dotyczy WYŁĄCZNIE budżetu wieku.
+        // Gdy odtwarzanie stoi, zatrzask niżej porzuca fragmenty tak samo jak
+        // ogony — nie ma dokąd ich dostarczyć, a czekanie zablokowałoby cały
+        // tor AI (łańcuch kanałów bounded(1) z blokującym send).
         if !matches!(job.kind, JobKind::Fragment { .. }) && age > MAX_JOB_AGE {
             dropped_finals += 1;
             log::warn!(
@@ -1093,18 +1110,26 @@ fn tts_thread(
         // odtwarzania przestaje być wołany, i wstrzymuje CAŁY tor AI
         // (STT → MT → TTS to łańcuch kanałów bounded(1) z blokującym send),
         // bez zgłoszenia czegokolwiek przez HealthGuard — wątek przecież żyje.
+        // Zakres tego zabezpieczenia (zatrzymany ZEGAR grafu, a nie utrata
+        // celu odtwarzania) opisany przy TTS_PUSH_STALL_BUDGET.
         let mut rest = &clip48[..];
         let mut last_progress = Instant::now();
         loop {
             match stall_decision(last_progress.elapsed(), stalled, TTS_PUSH_STALL_BUDGET) {
+                // `dropped_finals` jest sumaryczne i NIGDY nie zerowane — to
+                // jedyny licznik „ile treści realnie nie usłyszał słuchacz".
+                // `stalled_*` liczą wyłącznie bieżące okno zatrzasku i giną
+                // przy wznowieniu; gdyby porzucenia zatrzasku szły tylko tam,
+                // informacja o utraconej mowie znikałaby bez śladu.
                 StallAction::Abandon => {
+                    dropped_finals += 1;
                     stalled_clips += 1;
                     stalled_secs += rest.len() as f32 / crate::pw::RATE as f32;
                     if last_stall_log.elapsed() >= TTS_STALL_LOG_INTERVAL {
                         log::warn!(
                             "odtwarzanie stoi od {:.0}s — porzucam mowę lektora na bieżąco \
                              ({stalled_clips} klipów, {stalled_secs:.1}s mowy; ostatni wiek \
-                             zadania {:.1}s)",
+                             zadania {:.1}s; porzuconych ogonów łącznie: {dropped_finals})",
                             stalled_since.elapsed().as_secs_f32(),
                             age_now.as_secs_f32()
                         );
@@ -1113,6 +1138,7 @@ fn tts_thread(
                     break;
                 }
                 StallAction::Latch => {
+                    dropped_finals += 1;
                     stalled = true;
                     stalled_since = Instant::now();
                     last_stall_log = Instant::now();
@@ -1121,7 +1147,8 @@ fn tts_thread(
                     log::warn!(
                         "#{label} odtwarzanie nie przyjmuje próbek od {}s — porzucam \
                          {stalled_secs:.1}s z {clip_secs:.1}s mowy lektora i przechodzę \
-                         w tryb porzucania, żeby nie zablokować toru AI",
+                         w tryb porzucania, żeby nie zablokować toru AI \
+                         (porzuconych ogonów łącznie: {dropped_finals})",
                         TTS_PUSH_STALL_BUDGET.as_secs()
                     );
                     break;
