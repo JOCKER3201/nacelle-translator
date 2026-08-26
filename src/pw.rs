@@ -11,11 +11,14 @@
 //!  4. przy automatycznym wyborze celu odfiltrowujemy własne węzły I każdy
 //!     wirtualny sink obcego pochodzenia (akceptujemy tylko sprzęt ALSA/BT).
 //!
-//! Odporność: oba strumienie rejestrują `state_changed` — błąd albo
-//! zniknięcie węzła (DONT_RECONNECT niszczy węzeł playbacku, gdy cel
-//! przepada) kończy program głośno zamiast zostawiać go jako cichego
-//! zombie. To samo dotyczy śmierci dowolnego wątku toru AI — sygnalizuje
-//! ją `health_rx` przekazany z `pipeline::spawn`.
+//! Odporność: oba strumienie rejestrują `state_changed`. Prawdziwy błąd
+//! strumienia (`stream.state()` faktycznie w Error) albo zniknięcie węzła
+//! (DONT_RECONNECT niszczy węzeł playbacku, gdy cel przepada) kończy program
+//! głośno zamiast zostawiać go jako cichego zombie. Rutynowy błąd sesyjny od
+//! WirePlumbera — dostarczany jako zdarzenie `Error` BEZ zmiany stanu
+//! strumienia — jest tylko logowany; szczegóły przy `verdict`. To samo
+//! dotyczy śmierci dowolnego wątku toru AI — sygnalizuje ją `health_rx`
+//! przekazany z `pipeline::spawn`.
 
 use anyhow::{bail, Result};
 use pipewire as pw;
@@ -503,6 +506,48 @@ struct PlayState {
 /// zamieniany na `Err`, żeby proces zakończył się głośno zamiast wisieć.
 type Fatal = Rc<RefCell<Option<String>>>;
 
+/// Co strażnik ma zrobić z przejściem stanu.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Verdict {
+    Ignore,
+    Warn,
+    Fatal,
+}
+
+/// `StreamState::Error` przychodzi z DWÓCH źródeł i znaczą one co innego:
+///
+///  1. `proxy_error` (PipeWire 1.6.8, stream.c:1241-1252) emituje
+///     `state_changed(stream, stream->state, PW_STREAM_STATE_ERROR, message)`
+///     BEZ ZMIANY `stream->state` — sygnał czysto informacyjny. Tą drogą
+///     przychodzą rutynowe błędy sesyjne od WirePlumbera, rozsyłane przez
+///     `lutils.sendClientError` (linking/prepare-link.lua, find-defined-target.lua,
+///     find-filter-target.lua, link-target.lua) — typowo „no target node
+///     available". Zabijanie procesu na taki komunikat to reagowanie na
+///     zwykłą pracę serwera jak na awarię.
+///  2. `pw_stream_set_error` — prawdziwa awaria (odrzucona negocjacja formatu,
+///     brak buforów, błąd core). Ta ścieżka stan ZMIENIA.
+///
+/// Rozróżnia je odczyt `stream.state()` w chwili callbacku: w przypadku 1 jest
+/// tam nadal stary stan, w przypadku 2 jest Error. Bez tego rozróżnienia
+/// zostajemy albo z procesem umierającym na komunikat informacyjny, albo
+/// z niemym zombie po prawdziwym błędzie — a jedno i drugie jest gorsze niż
+/// dzisiejsze zachowanie.
+///
+/// `Unconnected` po tym, jak węzeł już raz działał, zostaje fatalne: po
+/// stronie klienta ten stan powstaje wyłącznie w `proxy_removed`,
+/// `proxy_destroy` i w `on_core_error` przy `res == -EPIPE` — czyli albo
+/// straciliśmy serwer, albo (dopóki na strumieniu odtwarzania stoi
+/// DONT_RECONNECT) zniknął cel. Odlinkowanie samo w sobie NIE daje
+/// `Unconnected`: „normally idle nodes keep processing" (man 7 pipewire-props).
+fn verdict(new: &StreamState, stream_state_is_error: bool, was_active: bool) -> Verdict {
+    match new {
+        StreamState::Error(_) if stream_state_is_error => Verdict::Fatal,
+        StreamState::Error(_) => Verdict::Warn,
+        StreamState::Unconnected if was_active => Verdict::Fatal,
+        _ => Verdict::Ignore,
+    }
+}
+
 fn watch_stream<D>(
     name: &'static str,
     fatal: &Fatal,
@@ -511,21 +556,35 @@ fn watch_stream<D>(
     let fatal = fatal.clone();
     let ml = ml.clone();
     let was_active = Cell::new(false);
-    move |_stream, _ud, old, new| {
+    move |stream, _ud, old, new| {
         log::debug!("{name}: stan {old:?} -> {new:?}");
-        match new {
-            StreamState::Error(msg) => {
-                *fatal.borrow_mut() = Some(format!("{name}: błąd strumienia: {msg}"));
+        if matches!(new, StreamState::Streaming | StreamState::Paused) {
+            was_active.set(true);
+        }
+        let state_is_error = matches!(stream.state(), StreamState::Error(_));
+        match verdict(&new, state_is_error, was_active.get()) {
+            Verdict::Ignore => {}
+            Verdict::Warn => {
+                let msg = match &new {
+                    StreamState::Error(m) => m.as_str(),
+                    _ => "",
+                };
+                log::warn!(
+                    "{name}: błąd sesyjny od serwera (zwykle brak celu albo nieudany link), \
+                     stan strumienia bez zmian — pracuję dalej: {msg}"
+                );
+            }
+            Verdict::Fatal => {
+                let reason = match &new {
+                    StreamState::Error(m) => format!("{name}: błąd strumienia: {m}"),
+                    _ => format!(
+                        "{name}: węzeł wypadł z grafu — zerwane połączenie z PipeWire \
+                         albo zniknął cel odtwarzania (strumień ma DONT_RECONNECT)"
+                    ),
+                };
+                *fatal.borrow_mut() = Some(reason);
                 ml.quit();
             }
-            StreamState::Streaming | StreamState::Paused => was_active.set(true),
-            StreamState::Unconnected if was_active.get() => {
-                *fatal.borrow_mut() = Some(format!(
-                    "{name}: węzeł zniknął z grafu (cel odtwarzania usunięty?)"
-                ));
-                ml.quit();
-            }
-            _ => {}
         }
     }
 }
@@ -916,6 +975,49 @@ mod tests {
         assert_eq!(snap.min_samples, 64);
         assert_eq!(snap.max_samples, 64);
         assert_eq!(snap.cycles, 1);
+    }
+
+    fn err(m: &str) -> StreamState {
+        StreamState::Error(m.to_string())
+    }
+
+    #[test]
+    fn w5_blad_sesyjny_bez_zmiany_stanu_to_tylko_ostrzezenie() {
+        // sendClientError od WirePlumbera: zdarzenie Error, ale stream.state()
+        // nadal Streaming/Paused — proces ma to przeżyć
+        assert_eq!(
+            verdict(&err("no target node available"), false, true),
+            Verdict::Warn
+        );
+        assert_eq!(verdict(&err("cokolwiek"), false, false), Verdict::Warn);
+    }
+
+    #[test]
+    fn w6_prawdziwy_blad_strumienia_zostaje_fatalny() {
+        // pw_stream_set_error: stan strumienia FAKTYCZNIE jest Error
+        assert_eq!(verdict(&err("format rejected"), true, true), Verdict::Fatal);
+        assert_eq!(verdict(&err("no buffers"), true, false), Verdict::Fatal);
+    }
+
+    #[test]
+    fn w7_unconnected_fatalny_dopiero_po_aktywnosci() {
+        // przed pierwszym Streaming/Paused Unconnected jest stanem startowym
+        assert_eq!(verdict(&StreamState::Unconnected, false, false), Verdict::Ignore);
+        assert_eq!(verdict(&StreamState::Unconnected, false, true), Verdict::Fatal);
+    }
+
+    #[test]
+    fn w8_stany_robocze_ignorowane() {
+        for s in [
+            StreamState::Connecting,
+            StreamState::Paused,
+            StreamState::Streaming,
+        ] {
+            assert_eq!(verdict(&s, false, true), Verdict::Ignore, "{s:?}");
+            // nawet gdy stream.state() zdąży już pokazać Error, samo przejście
+            // w stan roboczy nie jest powodem do zabijania procesu
+            assert_eq!(verdict(&s, true, true), Verdict::Ignore, "{s:?}");
+        }
     }
 
     #[test]
