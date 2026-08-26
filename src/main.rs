@@ -162,7 +162,10 @@ fn cmd_devices() -> Result<()> {
         } else {
             "-"
         };
-        let is_default = if default.as_deref() == Some(s.name.as_str()) { "*" } else { "" };
+        // gwiazdka przy wyjściu AKTYWNYM (tym, po które WirePlumber sięga przy
+        // linkowaniu), a nie przy zapamiętanym wyborze — ten drugi potrafi
+        // wskazywać urządzenie, którego w tej chwili nie ma w grafie
+        let is_default = if default.effective() == Some(s.name.as_str()) { "*" } else { "" };
         println!(
             "{:>5}  {:<7} {:<4} {:<60} {}",
             s.id, hw, is_default, s.name, s.description
@@ -333,23 +336,44 @@ fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> R
     match pw::discover_sinks() {
         Ok((sinks, default)) => {
             println!("  OK    PipeWire: {} węzłów Audio/Sink", sinks.len());
-            match default.as_deref() {
-                Some(name) => println!("  OK    aktualne domyślne wyjście (odczyt): {name}"),
-                None => println!("  OK    aktualne domyślne wyjście: nie udało się odczytać (użyję heurystyki)"),
+            // OBA klucze osobno. `default.audio.sink` (aktywny) decyduje
+            // o routingu, `default.configured.audio.sink` to zapamiętany wybór
+            // użytkownika i potrafi wskazywać sprzęt, którego nie ma w grafie.
+            // Sklejone w jedno maskowały się nawzajem.
+            match default.active.as_deref() {
+                Some(name) => println!("  OK    aktywne domyślne wyjście (default.audio.sink): {name}"),
+                None => println!("  OK    aktywne domyślne wyjście: nie udało się odczytać"),
+            }
+            match default.configured.as_deref() {
+                Some(name) => println!("  OK    zapamiętany wybór (default.configured.audio.sink): {name}"),
+                None => println!("  OK    zapamiętany wybór wyjścia: brak"),
             }
             // Celu NIE sprawdzamy — nie mamy go. Wybiera WirePlumber, a my
-            // wpinamy się w to, co jest domyślne w danej chwili. Jedyny stan
-            // wart zgłoszenia to ten, w którym domyślnym wyjściem jesteśmy MY:
-            // wtedy przelotka nie ma dokąd grać.
-            if default.as_deref() == Some(pw::SINK_NODE_NAME) {
+            // wpinamy się w to, co jest domyślne w danej chwili.
+            //
+            // UWAGA, nie BŁĄD: gdy domyślnym wyjściem jest nasz węzeł, dźwięk
+            // MIMO TO gra. find-default-target.lua nie ustawia celu (canLink
+            // odmawia na własnej link-group), ale też nie przerywa
+            // przetwarzania, więc find-best-target.lua pomija inteligentne
+            // filtry i dopina nas do najlepszego sprzętowego sinka. Poprzednia
+            // wersja zwracała tu kod wyjścia 1 za stan, który działa.
+            let us_active = default.active.as_deref() == Some(pw::SINK_NODE_NAME);
+            let us_configured = default.configured.as_deref() == Some(pw::SINK_NODE_NAME);
+            if us_active || us_configured {
+                let które = match (us_active, us_configured) {
+                    (true, true) => "aktywnym domyślnym wyjściem I zapamiętanym wyborem",
+                    (true, false) => "aktywnym domyślnym wyjściem",
+                    _ => "zapamiętanym wyborem wyjścia",
+                };
                 println!(
-                    "  BŁĄD  domyślnym wyjściem dźwięku jest sam translator ({}) — w tym \
-                     ustawieniu będzie NIEMY.\n        Translator jest przelotką, nie \
+                    "  UWAGA {} jest sam translator ({}) — dźwięk będzie grał (WirePlumber \
+                     dopnie nasz strumień do sprzętu przez find-best-target), ale to \
+                     ustawienie jest mylące.\n        Translator jest przelotką, nie \
                      urządzeniem: wybierz w Ustawieniach systemowych → Dźwięk swój prawdziwy \
                      sprzęt, a translator wpnie się w tor sam.",
+                    które,
                     pw::SINK_NODE_NAME
                 );
-                failures += 1;
             } else {
                 println!("  OK    translator wepnie się w aktualne domyślne wyjście (filter.smart)");
             }

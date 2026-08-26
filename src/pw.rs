@@ -60,13 +60,28 @@
 //!  2. filter-utils.lua pomija cele mające `node.link-group` ORAZ
 //!     `filter.smart` (getFilterSmartTarget:139-142) — żaden inny
 //!     inteligentny filtr nie wskaże nas jako celu i my nie wskażemy jego.
-//!  3. przypadek, którego NIE da się zablokować od naszej strony: gdy
-//!     użytkownik ustawi NASZ węzeł jako domyślne wyjście, domyślnym celem
-//!     naszego strumienia stajemy się my sami, `canLink` odmawia i zostajemy
-//!     niezlinkowani — cicho. Programowi nie wolno tu naprawiać metadanych
-//!     (nie nadpisujemy konfiguracji audio użytkownika), więc robi jedyną
-//!     uczciwą rzecz: wykrywa ten stan przy starcie i KRZYCZY w logu,
-//!     podając nazwę urządzenia do wybrania (`warn_if_default_is_us`).
+//!  3. gdy użytkownik ustawi NASZ węzeł jako domyślne wyjście, domyślnym
+//!     celem naszego strumienia stajemy się my sami i `canLink` odmawia.
+//!     To NIE kończy się ciszą — i to jest ważne, bo poprzednia wersja tego
+//!     komentarza (i cała diagnostyka pod nim) twierdziła inaczej.
+//!     find-default-target.lua nie robi `stop_processing`, więc sterowanie
+//!     leci dalej do linking/find-best-target.lua (zarejestrowany
+//!     w wireplumber.conf, `after = { ... find-default-target }`), a ten
+//!     iteruje po węzłach `item.node.type = device`, POMIJA inteligentne
+//!     filtry (czyli nas, linie 60-65) i wybiera najlepszy sprzętowy sink po
+//!     `priority.session`. Nasz strumień linkuje się więc do sprzętu, a że
+//!     aplikacje i tak trafiają w nas — dźwięk PRZECHODZI.
+//!     Ten stan jest zatem mylący, a nie zabójczy: mamy o nim ostrzec
+//!     (`warn_if_default_is_us`), ale nie wolno nam nazywać go awarią ani
+//!     zwracać za niego kodu błędu z `check`.
+//!  4. o tym, dokąd trafia nasz strumień, decyduje AKTYWNE domyślne wyjście
+//!     (`default.audio.sink`), a nie zapamiętany wybór użytkownika
+//!     (`default.configured.audio.sink`). Łańcuch: find-default-target →
+//!     linking-utils `findDefaultLinkable` → common-utils `getDefaultNode` →
+//!     plugin `default-nodes-api` / `get-default-node`, czyli wartość klucza
+//!     AKTYWNEGO. Oba klucze potrafią się rozjechać (np. gdy zapamiętane
+//!     urządzenie akurat nie istnieje), więc czujnik obserwuje OBA i ocenia
+//!     je OSOBNO — sklejenie ich przez `or_else` maskowało stan aktywny.
 //!
 //! Odporność: oba strumienie rejestrują `state_changed`. Prawdziwy błąd
 //! strumienia (`stream.state()` faktycznie w Error) albo przejście
@@ -434,7 +449,7 @@ fn enumerate_sinks(
 fn read_default_sink_name(
     mainloop: &pw::main_loop::MainLoopRc,
     core: &pw::core::CoreRc,
-) -> (Option<String>, DefaultSinkWatch) {
+) -> (DefaultSinks, DefaultSinkWatch) {
     // Uzbrajane dopiero po odczycie startowym (`arm()`), żeby początkowy
     // zrzut metadanych nie udawał zmiany zrobionej przez użytkownika.
     let armed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -446,7 +461,7 @@ fn read_default_sink_name(
         Ok(r) => r,
         Err(e) => {
             log::debug!("nie mogę pobrać rejestru do odczytu domyślnego wyjścia: {e:#}");
-            return (None, DefaultSinkWatch::inert(armed));
+            return (DefaultSinks::default(), DefaultSinkWatch::inert(armed));
         }
     };
     let metadata_bound: Rc<RefCell<Option<pw::metadata::Metadata>>> = Rc::new(RefCell::new(None));
@@ -485,39 +500,48 @@ fn read_default_sink_name(
                         let armed = armed.clone();
                         let state_raw = state_raw.clone();
                         move |_subject, key, _type_, value| {
-                            let slot = match key {
-                                Some("default.configured.audio.sink") => Some(&configured),
-                                Some("default.audio.sink") => Some(&active),
-                                _ => None,
-                            };
-                            if let (Some(slot), Some(v)) = (slot, value) {
-                                if let Ok(j) = serde_json::from_str::<serde_json::Value>(v) {
-                                    if let Some(n) = j["name"].as_str() {
-                                        *slot.borrow_mut() = Some(n.to_string());
-                                        // Zmiana urządzenia w aplecie KDE to
-                                        // ścieżka NORMALNA — przelotka
-                                        // przepina się sama (rescan.lua +
-                                        // prepare-link.lua, patrz nagłówek
-                                        // pliku). Logujemy ją, bo bez tego
-                                        // wpisu nie da się z logu sesji
-                                        // sprawdzić, że demon przeżył
-                                        // przełączenie — a to jest wymaganie
-                                        // twarde, nie ciekawostka.
-                                        if key == Some("default.configured.audio.sink")
-                                            && armed.get()
-                                            && !warn_if_default_is_us(
-                                                Some(n),
-                                                state_raw.as_deref(),
-                                            )
-                                        {
-                                            log::info!(
-                                                "domyślne wyjście dźwięku zmieniono na \"{n}\" \
-                                                 — przelotka podąża za tym wyborem sama, bez \
-                                                 restartu"
-                                            );
-                                        }
-                                    }
+                            // OBA klucze, nie tylko `configured`: o linkowaniu
+                            // decyduje AKTYWNY `default.audio.sink` (nagłówek
+                            // pliku, punkt 4), a WirePlumber potrafi go zmienić
+                            // sam, nie dotykając zapamiętanego wyboru.
+                            let (slot, kind) = match key {
+                                Some("default.configured.audio.sink") => {
+                                    (&configured, DefaultSlot::Configured)
                                 }
+                                Some("default.audio.sink") => (&active, DefaultSlot::Active),
+                                _ => return 0,
+                            };
+                            let Some(v) = value else { return 0 };
+                            let Ok(j) = serde_json::from_str::<serde_json::Value>(v) else {
+                                return 0;
+                            };
+                            let Some(n) = j["name"].as_str() else { return 0 };
+                            // Serwer potrafi przysłać tę samą wartość ponownie
+                            // (np. przy rescanie). Bez porównania z poprzednią
+                            // log dostawałby duplikaty zdarzenia, którego nie
+                            // było.
+                            if slot.borrow().as_deref() == Some(n) {
+                                return 0;
+                            }
+                            *slot.borrow_mut() = Some(n.to_string());
+                            if !armed.get() {
+                                return 0;
+                            }
+                            if warn_if_default_is_us(kind, Some(n), state_raw.as_deref()) {
+                                return 0;
+                            }
+                            // Zmiana urządzenia w aplecie KDE to ścieżka
+                            // NORMALNA — przelotka przepina się sama
+                            // (rescan.lua + prepare-link.lua, patrz nagłówek
+                            // pliku). Logujemy ją, bo bez tego wpisu nie da
+                            // się z logu sesji sprawdzić, że demon przeżył
+                            // przełączenie — a to jest wymaganie twarde,
+                            // nie ciekawostka.
+                            if kind == DefaultSlot::Configured {
+                                log::info!(
+                                    "domyślne wyjście dźwięku zmieniono na \"{n}\" \
+                                     — przelotka podąża za tym wyborem sama, bez restartu"
+                                );
                             }
                             0
                         }
@@ -547,7 +571,7 @@ fn read_default_sink_name(
         Ok(())
     })() {
         log::debug!("odczyt domyślnego wyjścia: {e:#}");
-        return (None, DefaultSinkWatch::inert(armed));
+        return (DefaultSinks::default(), DefaultSinkWatch::inert(armed));
     }
 
     // przebieg 2: gwarantuje dotarcie początkowego zrzutu property() z metadanych
@@ -568,15 +592,20 @@ fn read_default_sink_name(
         Ok(())
     })() {
         log::debug!("odczyt domyślnego wyjścia (przebieg 2): {e:#}");
-        return (None, DefaultSinkWatch::inert(armed));
+        return (DefaultSinks::default(), DefaultSinkWatch::inert(armed));
     }
 
     // `borrow().clone()` zamiast `take()`: podpięcie ma żyć dalej i porównywać
     // przyszłe zmiany, więc nie wolno opróżnić slotów.
-    let name = configured
-        .borrow()
-        .clone()
-        .or_else(|| active.borrow().clone());
+    //
+    // Oba sloty ODDZIELNIE. Dawne `configured.or_else(active)` maskowało
+    // dokładnie ten stan, który jest groźny: zapamiętany wybór wskazuje
+    // sprzęt, a aktywnym domyślnym wyjściem (tym, po które sięga
+    // `findDefaultLinkable`) jesteśmy my.
+    let name = DefaultSinks {
+        configured: configured.borrow().clone(),
+        active: active.borrow().clone(),
+    };
     let watch = DefaultSinkWatch {
         armed,
         state_raw,
@@ -586,12 +615,48 @@ fn read_default_sink_name(
     (name, watch)
 }
 
+/// Który z dwóch kluczy metadanych „default" opisuje daną nazwę.
+///
+/// Rozróżnienie jest istotne, bo klucze znaczą co innego i potrafią się
+/// rozjechać (patrz nagłówek pliku, punkt 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DefaultSlot {
+    /// `default.configured.audio.sink` — zapamiętany, świadomy wybór
+    /// użytkownika. Może wskazywać urządzenie, którego w tej chwili nie ma.
+    Configured,
+    /// `default.audio.sink` — to, po co WirePlumber faktycznie sięga przy
+    /// wyborze celu (`findDefaultLinkable` → `get-default-node`). Ten klucz
+    /// WirePlumber ustawia też SAM, bez udziału użytkownika.
+    Active,
+}
+
+/// Oba domyślne wyjścia odczytane z metadanych „default", każde osobno.
+///
+/// Nie ma tu metody „to jedno prawdziwe domyślne wyjście", bo takiej wartości
+/// nie ma: dla routingu liczy się `active`, dla intencji użytkownika
+/// `configured`, a sklejanie ich w jedno zamaskowało już raz stan, w którym
+/// aktywnym wyjściem był nasz własny węzeł.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DefaultSinks {
+    pub configured: Option<String>,
+    pub active: Option<String>,
+}
+
+impl DefaultSinks {
+    /// Wyjście, do którego faktycznie pojedzie dźwięk. `configured` służy tu
+    /// wyłącznie jako awaryjne źródło nazwy, gdy serwer nie przysłał jeszcze
+    /// klucza aktywnego.
+    pub fn effective(&self) -> Option<&str> {
+        self.active.as_deref().or(self.configured.as_deref())
+    }
+}
+
 /// Żywe podpięcie do obiektu metadanych "default" — WYŁĄCZNIE do odczytu.
 ///
 /// Dopóki uchwyty żyją, serwer woła nasz `property()` przy każdej zmianie
 /// domyślnego wyjścia. Program niczego tu nie zapisuje ani nie przełącza:
 /// przepięciem zajmuje się WirePlumber, a my tylko to odnotowujemy —
-/// i krzyczymy w jedynym przypadku, którego nie da się rozwiązać po naszej
+/// i ostrzegamy w jedynym stanie, którego nie da się rozwiązać po naszej
 /// stronie (domyślnym wyjściem jesteśmy MY sami).
 struct DefaultSinkWatch {
     /// dopóki `false`, callback milczy — inaczej początkowy zrzut metadanych
@@ -628,7 +693,7 @@ impl DefaultSinkWatch {
 
 /// Enumeracja węzłów Audio/Sink + odczyt aktualnie skonfigurowanego
 /// domyślnego wyjścia, w jednej sesji (podkomendy `devices` i `check`).
-pub fn discover_sinks() -> Result<(Vec<SinkInfo>, Option<String>)> {
+pub fn discover_sinks() -> Result<(Vec<SinkInfo>, DefaultSinks)> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
@@ -672,19 +737,34 @@ fn previous_configured_sink(raw: &str) -> Option<String> {
     candidates.first().map(|(_, v)| v.to_string())
 }
 
-/// Jedyna reakcja programu na sytuację „użytkownik ustawił NASZ węzeł jako
-/// domyślne wyjście dźwięku": jeden głośny wpis w logu.
+/// Reakcja programu na sytuację „domyślnym wyjściem dźwięku jest NASZ węzeł":
+/// jeden wpis w logu, osobno dla każdego z dwóch kluczy metadanych.
 ///
-/// Dlaczego tylko log. W tym stanie domyślnym celem naszego strumienia
-/// odtwarzania stajemy się my sami, `canLinkGroupCheck` odmawia linkowania
-/// (patrz nagłówek pliku, punkt 1) i przelotka milknie. Naprawić dałoby się
-/// to jednym zapisem `default.configured.audio.sink` — i tego WŁAŚNIE nie
-/// robimy: program nie nadpisuje konfiguracji audio użytkownika. Zostaje
-/// powiedzieć głośno, co jest nie tak i co kliknąć.
+/// DLACZEGO `warn`, A NIE `error`. Wcześniejsza wersja tej funkcji krzyczała
+/// `log::error!`, że translator „będzie NIEMY". To była nieprawda i trzeba to
+/// powiedzieć wprost, bo na tej tezie wisiała cała instrukcja odsłuchu.
+/// Gdy domyślnym sinkiem jesteśmy my, find-default-target.lua dostaje nasz
+/// własny `main_si`, `canLink` odmawia — ale hook NIE robi `stop_processing`,
+/// więc sterowanie idzie do linking/find-best-target.lua, ten pomija
+/// inteligentne filtry (nas) i wybiera najlepszy sprzętowy sink. Nasz
+/// strumień linkuje się do sprzętu, aplikacje trafiają w nas jako w domyślne
+/// wyjście i dźwięk PRZECHODZI. Stan jest mylący (translator wygląda
+/// w miksererach jak urządzenie, a jego nazwa zatyka stos zapamiętanych
+/// wyborów), ale nie jest awarią — nie wolno więc ani nazywać go awarią,
+/// ani zwracać za niego niezerowego kodu wyjścia z `check`.
 ///
-/// `log::error!`, nie `warn`: bez tej zmiany przez użytkownika program jest
-/// niemy, więc to nie jest „uwaga na marginesie".
-fn warn_if_default_is_us(default_sink: Option<&str>, state_raw: Option<&str>) -> bool {
+/// DLACZEGO MIMO TO OSTRZEGAMY. Naprawić ten stan dałoby się jednym zapisem
+/// `default.configured.audio.sink` — i tego WŁAŚNIE nie robimy: program nie
+/// nadpisuje konfiguracji audio użytkownika. Zostaje powiedzieć, co jest nie
+/// tak i co kliknąć.
+///
+/// Zwraca `true`, gdy nazwa wskazuje na nas (wołający pomija wtedy zwykły log
+/// o przepięciu — nie było przepięcia na cudze urządzenie).
+fn warn_if_default_is_us(
+    slot: DefaultSlot,
+    default_sink: Option<&str>,
+    state_raw: Option<&str>,
+) -> bool {
     let own = [SINK_NODE_NAME, OUT_NODE_NAME];
     if !default_sink.is_some_and(|n| own.contains(&n)) {
         return false;
@@ -695,13 +775,30 @@ fn warn_if_default_is_us(default_sink: Option<&str>, state_raw: Option<&str>) ->
         // sprzętu — od tego jest `nacelle-translator devices`.
         None => "Wybierz swoje urządzenie (lista: nacelle-translator devices)".to_string(),
     };
-    log::error!(
-        "domyślnym wyjściem dźwięku jest NASZ własny węzeł ({SINK_NODE_NAME}) — w tym \
-         ustawieniu translator nie ma dokąd grać i będzie NIEMY. Translator jest przelotką \
-         w torze, a nie urządzeniem: nie wybiera się go jako wyjścia, tylko wpina się sam \
-         w to, co masz wybrane. {hint} — w Ustawieniach systemowych KDE → Dźwięk (albo \
-         `wpctl set-default <ID>`). Translator podąży za tym wyborem sam, bez restartu."
-    );
+    // Dwa różne stany, dwa różne komunikaty. `Active` to ten, który realnie
+    // wpływa na routing — i ten, który WirePlumber potrafi ustawić SAM, bez
+    // udziału użytkownika (np. gdy zniknie ostatni sprzętowy sink, a nasz
+    // węzeł zostanie jedynym w systemie: fallback-sink.lua liczy nas jako
+    // zwykły sink, bo filtruje po `wireplumber.is-virtual`, a nie po
+    // `node.virtual`, więc nawet „Dummy Output" wtedy nie powstanie).
+    match slot {
+        DefaultSlot::Active => log::warn!(
+            "aktywnym domyślnym wyjściem dźwięku (default.audio.sink) jest NASZ własny węzeł \
+             ({SINK_NODE_NAME}). Dźwięk gra dalej — WirePlumber dopina nasz strumień do \
+             sprzętu przez linking/find-best-target.lua — ale to ustawienie jest mylące \
+             i potrafi znaczyć, że zniknęło Twoje urządzenie wyjściowe. Translator jest \
+             przelotką w torze, a nie urządzeniem: nie wybiera się go jako wyjścia, tylko \
+             wpina się sam w to, co masz wybrane. {hint} — w Ustawieniach systemowych KDE → \
+             Dźwięk (albo `wpctl set-default <ID>`). Translator podąży za tym wyborem sam, \
+             bez restartu."
+        ),
+        DefaultSlot::Configured => log::warn!(
+            "zapamiętanym wyborem wyjścia dźwięku (default.configured.audio.sink) jest NASZ \
+             własny węzeł ({SINK_NODE_NAME}). To nie zatrzymuje dźwięku, ale zatyka stos \
+             zapamiętanych wyborów WirePlumbera i po każdym restarcie wraca. {hint} — \
+             w Ustawieniach systemowych KDE → Dźwięk."
+        ),
+    }
     true
 }
 
@@ -898,15 +995,35 @@ pub fn run_graph(
     let core = context.connect_rc(None)?;
 
     // Odczyt (i TYLKO odczyt) domyślnego wyjścia. Nie po to, żeby coś wybrać
-    // — wybiera WirePlumber — tylko żeby wyłapać jedyny stan, w którym
-    // przelotka nie ma dokąd grać: gdy domyślnym wyjściem jesteśmy my sami.
+    // — wybiera WirePlumber — tylko żeby odnotować stan, w którym domyślnym
+    // wyjściem jesteśmy my sami.
     // `default_watch` MUSI dożyć końca `run_graph`: jego wcześniejszy drop
     // wypina słuchacza i późniejsze zmiany urządzenia znikają z logu.
     let (default_sink, default_watch) = read_default_sink_name(&mainloop, &core);
-    warn_if_default_is_us(default_sink.as_deref(), default_watch.state_raw());
-    match default_sink.as_deref() {
-        Some(n) => log::info!("aktualne domyślne wyjście (odczyt): {n}"),
-        None => log::info!(
+    // OBA sloty osobno: `configured` bywa nieaktualny (wskazuje sprzęt, którego
+    // nie ma), a o routingu decyduje `active`. Sklejenie ich przez `or_else`
+    // potrafiło pokazać sprzęt i przemilczeć, że aktywnym wyjściem jesteśmy MY.
+    warn_if_default_is_us(
+        DefaultSlot::Active,
+        default_sink.active.as_deref(),
+        default_watch.state_raw(),
+    );
+    warn_if_default_is_us(
+        DefaultSlot::Configured,
+        default_sink.configured.as_deref(),
+        default_watch.state_raw(),
+    );
+    match (
+        default_sink.active.as_deref(),
+        default_sink.configured.as_deref(),
+    ) {
+        (Some(a), Some(c)) if a != c => log::info!(
+            "domyślne wyjście (odczyt): aktywne \"{a}\", zapamiętany wybór \"{c}\" — liczy się \
+             aktywne, to po nie sięga WirePlumber przy wyborze celu"
+        ),
+        (Some(a), _) => log::info!("aktualne domyślne wyjście (odczyt): {a}"),
+        (None, Some(c)) => log::info!("zapamiętany wybór wyjścia (odczyt): {c}"),
+        (None, None) => log::info!(
             "nie udało się odczytać domyślnego wyjścia — to nie jest błąd, cel i tak wybiera \
              WirePlumber"
         ),
@@ -1509,17 +1626,71 @@ default.configured.audio.sink.1=alsa_output.pci-0000_73_00.6.analog-stereo
 
     #[test]
     fn p5_alarm_tylko_gdy_domyslnym_jestesmy_my() {
+        use DefaultSlot::*;
         // Zwykły sprzęt jako domyślne wyjście to stan NORMALNY — ani słowa.
-        assert!(!warn_if_default_is_us(Some("alsa_output.cokolwiek"), Some(STATE)));
+        assert!(!warn_if_default_is_us(
+            Active,
+            Some("alsa_output.cokolwiek"),
+            Some(STATE)
+        ));
         // Brak odczytu też nie jest powodem do alarmu: cel i tak wybiera
         // WirePlumber, a my o tym nie decydujemy.
-        assert!(!warn_if_default_is_us(None, Some(STATE)));
-        // Oba nasze węzły są powodem: przy każdym z nich strumień nie ma
-        // dokąd grać (canLinkGroupCheck odmawia w obie strony).
-        assert!(warn_if_default_is_us(Some(SINK_NODE_NAME), Some(STATE)));
-        assert!(warn_if_default_is_us(Some(OUT_NODE_NAME), Some(STATE)));
+        assert!(!warn_if_default_is_us(Active, None, Some(STATE)));
+        // Oba nasze węzły są powodem, w obu slotach.
+        assert!(warn_if_default_is_us(Active, Some(SINK_NODE_NAME), Some(STATE)));
+        assert!(warn_if_default_is_us(Active, Some(OUT_NODE_NAME), Some(STATE)));
+        assert!(warn_if_default_is_us(
+            Configured,
+            Some(SINK_NODE_NAME),
+            Some(STATE)
+        ));
         // ... i brak pliku stanu nie może tego alarmu wyciszyć
-        assert!(warn_if_default_is_us(Some(SINK_NODE_NAME), None));
+        assert!(warn_if_default_is_us(Active, Some(SINK_NODE_NAME), None));
+    }
+
+    #[test]
+    fn p6_aktywne_wyjscie_nie_moze_sie_schowac_za_zapamietanym() {
+        // TA klasa błędu przeszła recenzję poprzedniej wersji: kod sklejał oba
+        // sloty przez `configured.or_else(active)`, więc stan „zapamiętany
+        // wybór wskazuje sprzęt, a AKTYWNYM wyjściem jesteśmy MY" zwracał
+        // nazwę sprzętu i nikt się o nim nie dowiadywał. A to właśnie ten
+        // slot decyduje o wyborze celu (findDefaultLinkable → get-default-node).
+        let d = DefaultSinks {
+            configured: Some("alsa_output.cokolwiek".into()),
+            active: Some(SINK_NODE_NAME.into()),
+        };
+        assert_eq!(d.effective(), Some(SINK_NODE_NAME));
+        assert!(warn_if_default_is_us(
+            DefaultSlot::Active,
+            d.active.as_deref(),
+            Some(STATE)
+        ));
+        assert!(!warn_if_default_is_us(
+            DefaultSlot::Configured,
+            d.configured.as_deref(),
+            Some(STATE)
+        ));
+    }
+
+    #[test]
+    fn p7_zapamietany_wybor_nie_udaje_aktywnego() {
+        // Odwrotny rozjazd, obserwowany na żywo: `default.configured` wskazuje
+        // nasz węzeł (zostałość po starym modelu), a aktywnym wyjściem jest
+        // prawdziwy sprzęt, bo naszego węzła akurat nie ma w grafie.
+        // `effective()` musi pokazać sprzęt — inaczej `devices` gubi gwiazdkę,
+        // a `check` opisuje stan, którego nie ma.
+        let d = DefaultSinks {
+            configured: Some(SINK_NODE_NAME.into()),
+            active: Some("alsa_output.cokolwiek".into()),
+        };
+        assert_eq!(d.effective(), Some("alsa_output.cokolwiek"));
+        // brak aktywnego = spadamy na zapamiętany, bo lepsza taka nazwa niż żadna
+        let tylko_configured = DefaultSinks {
+            configured: Some("alsa_output.x".into()),
+            active: None,
+        };
+        assert_eq!(tylko_configured.effective(), Some("alsa_output.x"));
+        assert_eq!(DefaultSinks::default().effective(), None);
     }
 
     #[test]
