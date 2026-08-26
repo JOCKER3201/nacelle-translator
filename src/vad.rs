@@ -13,6 +13,10 @@ const CHUNK_MS: u32 = (VAD_CHUNK * 1000 / VAD_RATE) as u32; // 32 ms
 pub struct Utterance {
     /// mono f32 16 kHz
     pub audio: Vec<f32>,
+    /// generacja segmentu, pod którą powstawały przebiegi częściowe
+    /// spekulacyjnego STT — final i migawki z tą samą wartością należą do
+    /// tego samego bufora audio
+    pub gen: u64,
     /// segment ucięty w trakcie mowy (mowa trwa dalej)
     pub forced: bool,
     /// jak doszło do domknięcia — kluczowa dana diagnostyczna dla trudnego
@@ -79,6 +83,11 @@ pub struct Segmenter {
     /// i krótka końcówka frazy ("...see you tomorrow" → "tomorrow")
     /// przepadałaby bez transkrypcji
     tail_of_forced_cut: bool,
+    /// generacja bieżącego (otwartego) segmentu — rośnie przy KAŻDYM
+    /// domknięciu (pauza, odrzucenie za-krótkiego, cięcie wymuszone);
+    /// spekulacyjne STT odrzuca w całości wyniki przebiegów ze starszą
+    /// generacją, bo dotyczą audio, którego już nie ma w buforze
+    gen: u64,
 }
 
 impl Segmenter {
@@ -97,6 +106,7 @@ impl Segmenter {
             p_sum: 0.0,
             p_n: 0,
             tail_of_forced_cut: false,
+            gen: 1, // pierwszy segment = generacja 1 (logi fragmentów "#1.0")
         }
     }
 
@@ -124,6 +134,18 @@ impl Segmenter {
     /// dostarczać audio, np. gdy aplikacja źródłowa jest w pauzie).
     pub fn is_idle(&self) -> bool {
         matches!(self.state, State::Idle)
+    }
+
+    /// Migawka OTWARTEGO segmentu dla spekulacyjnego STT: (generacja, kopia
+    /// całego bufora audio, ms rozpoznanej mowy). None gdy nic nie jest
+    /// otwarte. Kopia, nie pożyczka — wątek STT pracuje na niej, gdy bufor
+    /// dalej rośnie. Bramkę min_open_ms stosuje WYWOŁUJĄCY (tam mieszka
+    /// config STT); koszt klonu (maks. ~512 KB co kadencję) jest pomijalny.
+    pub fn open_snapshot(&self) -> Option<(u64, Vec<f32>, u32)> {
+        if matches!(self.state, State::Idle) {
+            return None;
+        }
+        Some((self.gen, self.seg.clone(), self.speech_ms))
     }
 
     /// Podaj kolejne okno 512 próbek wraz z prawdopodobieństwem mowy z VAD.
@@ -193,11 +215,19 @@ impl Segmenter {
                 };
                 if silence_ms >= hangover_needed {
                     let (p_min, p_mean) = self.take_p_stats();
+                    // M1: KAŻDE domknięcie inkrementuje generację — także
+                    // odrzucenie za-krótkiego segmentu niżej: migawki pobrane
+                    // z odrzuconego bufora muszą stać się nieważne, inaczej
+                    // przebieg częściowy odrzuconego audio skleiłby się
+                    // w trackerze z następnym segmentem
+                    let closing_gen = self.gen;
+                    self.gen += 1;
                     let out = if self.speech_ms >= self.cfg.min_speech_ms
                         || self.tail_of_forced_cut
                     {
                         Some(Utterance {
                             audio: std::mem::take(&mut self.seg),
+                            gen: closing_gen,
                             forced: false,
                             reason: if hangover_needed < self.cfg.hangover_ms {
                                 CloseReason::SoftHangover
@@ -294,8 +324,16 @@ impl Segmenter {
         // dla diagnostyki wystarczające; ogon zaczyna liczyć od zera
         let (p_min, p_mean) = self.take_p_stats();
         self.tail_of_forced_cut = true;
+        // M1: cięcie wymuszone łamie założenie append-only bufora — nowy
+        // bufor zaczyna się nakładką akustycznie powielającą słowa być może
+        // już scommitowane; granica generacji wymusza w trackerze twardy
+        // reset, ŻADNEGO re-kotwiczenia przez tę granicę (duplikat
+        // z nakładki jest akceptowany projektowo)
+        let closing_gen = self.gen;
+        self.gen += 1;
         Some(Utterance {
             audio: head,
+            gen: closing_gen,
             forced: true,
             reason: if settled_dip {
                 CloseReason::SettledDip
@@ -305,5 +343,120 @@ impl Segmenter {
             p_min,
             p_mean,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// progi celowo malutkie (wielokrotności chunka 32 ms), żeby testy
+    /// obywały się bez Silero — push_chunk przyjmuje p jawnie
+    fn cfg() -> VadCfg {
+        VadCfg {
+            threshold_enter: 0.5,
+            threshold_exit: 0.35,
+            preroll_ms: 32,
+            min_speech_ms: 32,
+            hangover_ms: 64,
+            soft_hangover_ms: 64,
+            dip_settle_ms: 32,
+            dip_threshold: 0.6,
+            soft_max_ms: 320,
+            hard_max_ms: 320,
+            overlap_ms: 32,
+        }
+    }
+
+    fn chunk(v: f32) -> Vec<f32> {
+        vec![v; VAD_CHUNK]
+    }
+
+    /// mowa + cisza aż do domknięcia hangoverem; zwraca domknięty segment
+    fn speak_and_close(s: &mut Segmenter, speech_chunks: usize) -> Option<Utterance> {
+        let c = chunk(0.0);
+        let mut out = None;
+        for _ in 0..speech_chunks {
+            assert!(s.push_chunk(&c, 0.9).is_none());
+        }
+        for _ in 0..2 {
+            if let Some(u) = s.push_chunk(&c, 0.0) {
+                out = Some(u);
+            }
+        }
+        out
+    }
+
+    // V1: domknięcie hangoverem → gen 1; kolejny segment → gen 2
+    #[test]
+    fn v1_hangover_inkrementuje_generacje() {
+        let mut s = Segmenter::new(cfg());
+        let u1 = speak_and_close(&mut s, 4).expect("segment 1 domknięty");
+        assert!(!u1.forced);
+        assert_eq!(u1.gen, 1);
+        let u2 = speak_and_close(&mut s, 4).expect("segment 2 domknięty");
+        assert_eq!(u2.gen, 2);
+    }
+
+    // V2: cięcie wymuszone inkrementuje gen; migawka po cięciu należy już
+    // do NOWEJ generacji, a jej audio zaczyna się nakładką z głowy
+    #[test]
+    fn v2_forced_cut_nowa_generacja_i_naklada() {
+        let mut s = Segmenter::new(cfg());
+        let mut forced = None;
+        // ciągła mowa bez dołków — hard_max (320 ms = 10 chunków) tnie na
+        // pozycji ostatniego śledzonego dołka (koniec chunka nr 8)
+        for i in 0..10 {
+            let c = chunk(i as f32 * 0.001);
+            if let Some(u) = s.push_chunk(&c, 0.9) {
+                forced = Some((i, u));
+            }
+        }
+        let (at, u) = forced.expect("hard_max powinien wymusić cięcie");
+        assert_eq!(at, 9);
+        assert!(u.forced);
+        assert_eq!(u.gen, 1);
+        let (gen, audio, _) = s.open_snapshot().expect("mowa trwa dalej");
+        assert_eq!(gen, 2);
+        // nowy bufor = nakładka 32 ms (ostatnie 512 próbek głowy, chunk nr 8)
+        // + ogon (chunk nr 9)
+        assert_eq!(audio.len(), 2 * VAD_CHUNK);
+        assert_eq!(audio[0], 8.0 * 0.001);
+        assert_eq!(audio[VAD_CHUNK], 9.0 * 0.001);
+    }
+
+    // V3: open_snapshot — None w Idle, rosnąca kopia w Speech
+    #[test]
+    fn v3_snapshot_idle_none_potem_rosnie() {
+        let mut s = Segmenter::new(cfg());
+        assert!(s.open_snapshot().is_none());
+        let c = chunk(0.0);
+        assert!(s.push_chunk(&c, 0.9).is_none());
+        let (gen, a1, speech_ms) = s.open_snapshot().expect("segment otwarty");
+        assert_eq!(gen, 1);
+        assert_eq!(a1.len(), VAD_CHUNK);
+        assert_eq!(speech_ms, 32);
+        assert!(s.push_chunk(&c, 0.9).is_none());
+        let (_, a2, _) = s.open_snapshot().expect("segment nadal otwarty");
+        assert_eq!(a2.len(), 2 * VAD_CHUNK);
+    }
+
+    // V3b: odrzucenie za-krótkiego segmentu TEŻ inkrementuje gen — migawki
+    // pobrane z odrzuconego bufora muszą stać się nieważne
+    #[test]
+    fn v3b_odrzucenie_krotkiego_inkrementuje() {
+        let mut vcfg = cfg();
+        vcfg.min_speech_ms = 96; // wymagane 3 chunki mowy
+        let mut s = Segmenter::new(vcfg);
+        let c = chunk(0.0);
+        // 1 chunk mowy (32 ms < 96) + cisza do hangoveru → odrzucenie bez Utterance
+        assert!(s.push_chunk(&c, 0.9).is_none());
+        assert!(s.push_chunk(&c, 0.0).is_none());
+        assert!(s.push_chunk(&c, 0.0).is_none());
+        assert!(s.is_idle());
+        // następny segment dostaje generację 2 — odrzucenie skonsumowało 1
+        assert!(s.push_chunk(&c, 0.9).is_none());
+        let (gen, _, _) = s.open_snapshot().expect("segment otwarty");
+        assert_eq!(gen, 2);
     }
 }

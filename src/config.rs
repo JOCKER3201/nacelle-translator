@@ -62,6 +62,19 @@ pub struct VadCfg {
     /// muzycznym Silero nie schodzi poniżej threshold_exit nawet na
     /// granicach fraz, ale dołki 0.4-0.6 tam występują
     pub dip_threshold: f32,
+    /// NIEZMIENNIK: `hard_max_ms - soft_max_ms >= 2000`.
+    ///
+    /// Cięcie w ustabilizowanym dołku może odpalić NAJWCZEŚNIEJ w chwili
+    /// soft_max_ms — dołki są śledzone dopiero od `soft_max - dip_settle`
+    /// (vad.rs), a `settled_dip` wymaga jeszcze `dip_settle_ms` bez głębszego
+    /// dołka. Okno wyścigu "dołek zdąży przed twardym cięciem" to więc
+    /// DOKŁADNIE ta różnica, i zejście poniżej niej zamienia cięcia w dołku
+    /// (dobra granica frazy) na cięcia twarde (w połowie słowa).
+    /// Zmierzony w audycie rozkład czekania na ustabilizowany dołek, liczony
+    /// od soft_max: mediana 0.65 s, p90 1.33 s, p95 1.60 s, max 1.70 s —
+    /// czyli 2.0 s to p95 + 0.4 s marginesu i daje obserwowane 6 % domknięć
+    /// przez hard-max. Zwężenie okna: 1.5 s -> ~11 % hard-max, 1.25 s -> ~20 %,
+    /// 1.0 s -> ~23-26 %.
     pub soft_max_ms: u32,
     pub hard_max_ms: u32,
     pub overlap_ms: u32,
@@ -93,6 +106,28 @@ pub struct SttCfg {
     /// "auto" albo kod języka źródłowego, np. "en"
     pub language: String,
     pub threads: i32,
+    /// spekulacyjne STT: whisper puszczany co cadence_ms CZASU AUDIO na
+    /// rosnącym, otwartym segmencie; stabilny prefiks (LocalAgreement-2)
+    /// idzie do tłumaczenia od razu, final domyka tylko ogon.
+    ///
+    /// POLE WYŁĄCZNIE RUNTIME — celowo `skip`, czyli NIE do ustawienia z pliku
+    /// TOML: jedynym wejściem jest flaga `--experimental-features=speculative-stt`
+    /// (patrz experimental.rs), którą main.rs nakłada na wczytaną konfigurację.
+    /// Dzięki temu tor AI czyta dalej po prostu `stt_cfg.speculative` i nie musi
+    /// wiedzieć, skąd ta wartość pochodzi.
+    #[serde(skip)]
+    pub speculative: bool,
+    /// kadencja przebiegów częściowych [ms czasu audio] — liczona chunkami
+    /// segmentera (32 ms), nie zegarem ściennym: zegar ścienny kłamie przy
+    /// wstrzykiwanej ciszy i zaległościach resamplera
+    pub cadence_ms: u32,
+    /// poniżej tej długości otwartego bufora nie spekulujemy: pad zerowy
+    /// whispera (MIN_SAMPLES = 1,1 s) daje na krótkim audio skorelowane
+    /// halucynacje, które LocalAgreement błędnie uznałby za stabilne
+    pub min_open_ms: u32,
+    /// minimalna długość fragmentu w znakach (do interpunkcji frazowej);
+    /// krótsze fragmenty czekają na kolejny przebieg
+    pub min_fragment_chars: usize,
 }
 
 impl Default for SttCfg {
@@ -101,6 +136,10 @@ impl Default for SttCfg {
             model: "models/ggml-small.bin".into(),
             language: "auto".into(),
             threads: 8,
+            speculative: false,
+            cadence_ms: 400,
+            min_open_ms: 1500,
+            min_fragment_chars: 12,
         }
     }
 }
@@ -203,14 +242,47 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Klucze usunięte z pliku konfiguracyjnego wraz z podpowiedzią, co je
+/// zastąpiło. Wszystkie sekcje mają `deny_unknown_fields`, więc stary klucz
+/// wywala parsowanie CAŁEGO pliku — bez tej tablicy użytkownik dostaje
+/// wyłącznie serdowe "unknown field", które nie mówi, gdzie szukać funkcji.
+/// Dopisując tu kolejny wpis pamiętaj, że dopasowanie idzie po tekście błędu
+/// serde, więc nazwa musi być dokładna.
+const RETIRED_KEYS: &[(&str, &str)] = &[(
+    "speculative",
+    "spekulacyjne STT jest teraz funkcją eksperymentalną i włącza je WYŁĄCZNIE \
+     flaga wiersza poleceń: nacelle-translator --experimental-features=speculative-stt",
+)];
+
+/// Parsowanie z podmianą komunikatu dla wycofanych kluczy (osobno od `load`,
+/// żeby dało się to przetestować bez dotykania dysku).
+fn parse_str(raw: &str, path: &Path) -> anyhow::Result<Config> {
+    match toml::from_str::<Config>(raw) {
+        Ok(cfg) => Ok(cfg),
+        Err(e) => {
+            let msg = e.to_string();
+            if let Some((key, hint)) = RETIRED_KEYS
+                .iter()
+                .find(|(k, _)| msg.contains(&format!("unknown field `{k}`")))
+            {
+                anyhow::bail!(
+                    "{}: klucz `{key}` został wycofany z pliku konfiguracyjnego — {hint}\n\
+                     usuń linię z `{key}` z pliku i podaj flagę przy uruchomieniu",
+                    path.display()
+                );
+            }
+            Err(anyhow::Error::new(e))
+                .with_context(|| format!("błąd składni w {}", path.display()))
+        }
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         if path.exists() {
             let raw = std::fs::read_to_string(path)
                 .with_context(|| format!("nie mogę odczytać {}", path.display()))?;
-            let cfg: Config = toml::from_str(&raw)
-                .with_context(|| format!("błąd składni w {}", path.display()))?;
-            Ok(cfg)
+            parse_str(&raw, path)
         } else {
             log::info!(
                 "brak pliku {} — używam domyślnej konfiguracji",
@@ -230,5 +302,72 @@ impl Config {
 
     pub fn stt_model(&self) -> PathBuf {
         expand_tilde(&self.stt.model)
+    }
+
+    /// Strojenie, które ma sens tylko na JEDNYM z torów — sprawdzane po
+    /// nałożeniu opcji eksperymentalnych, więc widzi tor faktycznie wybrany.
+    ///
+    /// Powód: `soft_max_ms` podniesiony pod spekulację (6000) na torze
+    /// wsadowym nie jest „luźniejszym cięciem", tylko WPROST opóźnieniem
+    /// pierwszych słów lektora — bez spekulacji nic nie wychodzi z segmentera
+    /// przed domknięciem segmentu. Ten sam plik konfiguracyjny obsługuje oba
+    /// tory, więc rozjazd trzeba nazwać głośno, zamiast liczyć na pamięć.
+    pub fn tuning_warning(&self) -> Option<String> {
+        const BEZ_SPEKULACJI_MAX_MS: u32 = 3_000;
+        if !self.stt.speculative && self.vad.soft_max_ms > BEZ_SPEKULACJI_MAX_MS {
+            return Some(format!(
+                "vad.soft_max_ms = {} bez spekulacyjnego STT: pierwsze słowa lektora czekają \
+                 do {:.1} s od początku frazy — zejdź na 2000-3000 albo uruchom z flagą \
+                 --experimental-features=speculative-stt (pod nią wyższa wartość jest zyskiem)",
+                self.vad.soft_max_ms,
+                self.vad.soft_max_ms as f32 / 1000.0
+            ));
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wycofany_klucz_daje_komunikat_kierujacy_na_flage() {
+        let err = parse_str("[stt]\nspeculative = true\n", Path::new("nacelle-translator.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--experimental-features=speculative-stt"), "{err}");
+        assert!(err.contains("speculative"), "{err}");
+        assert!(!err.contains("unknown field"), "surowy błąd serde nie może wyciec: {err}");
+    }
+
+    #[test]
+    fn zwykly_blad_skladni_zostaje_bledem_skladni() {
+        let err = parse_str("[stt\n", Path::new("x.toml")).unwrap_err().to_string();
+        assert!(err.contains("błąd składni"), "{err}");
+    }
+
+    #[test]
+    fn wysoki_soft_max_bez_spekulacji_daje_ostrzezenie() {
+        let mut cfg = Config::default();
+        cfg.vad.soft_max_ms = 6_000;
+        let w = cfg.tuning_warning().expect("6000 bez spekulacji to opóźnienie, nie strojenie");
+        assert!(w.contains("6.0 s"), "{w}");
+        assert!(w.contains("--experimental-features=speculative-stt"), "{w}");
+        // ta sama wartość Z flagą jest zamierzona i musi milczeć
+        cfg.stt.speculative = true;
+        assert!(cfg.tuning_warning().is_none());
+        // wartość szablonowa nie hałasuje na żadnym torze
+        cfg.stt.speculative = false;
+        cfg.vad.soft_max_ms = 2_000;
+        assert!(cfg.tuning_warning().is_none());
+    }
+
+    #[test]
+    fn spekulacja_nie_jest_deserializowana_z_pliku() {
+        // reszta sekcji [stt] ma się dalej wczytywać normalnie
+        let cfg = parse_str("[stt]\nthreads = 4\n", Path::new("x.toml")).unwrap();
+        assert_eq!(cfg.stt.threads, 4);
+        assert!(!cfg.stt.speculative);
     }
 }

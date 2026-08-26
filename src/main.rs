@@ -4,8 +4,10 @@
 //!
 //! Podkomendy: run (domyślna), devices, check.
 
+mod agreement;
 mod audio;
 mod config;
+mod experimental;
 mod pipeline;
 mod pw;
 mod stt;
@@ -31,10 +33,24 @@ Opcje:
   -v, --verbose   więcej logów (poziom debug)
 ";
 
+/// Pełna pomoc = stała USAGE + lista opcji eksperymentalnych generowana
+/// z tablicy w experimental.rs (dopisanie opcji nie wymaga ruszania USAGE).
+fn usage() -> String {
+    format!("{USAGE}{}", experimental::help_block())
+}
+
+/// Wyjście z kodem 2 (zły wiersz poleceń) — odróżnialne od kodu 1, którym
+/// kończy się błąd działania już uruchomionego programu.
+fn die_usage(msg: &str) -> ! {
+    eprintln!("{msg}\n\n{}", usage());
+    std::process::exit(2);
+}
+
 fn main() {
     let mut cmd = String::from("run");
     let mut config_path = PathBuf::from("nacelle-translator.toml");
     let mut verbose = false;
+    let mut experimental = experimental::Selection::default();
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -42,20 +58,31 @@ fn main() {
             "run" | "devices" | "check" => cmd = a,
             "--config" => match args.next() {
                 Some(p) => config_path = PathBuf::from(p),
-                None => {
-                    eprintln!("--config wymaga ścieżki\n\n{USAGE}");
-                    std::process::exit(2);
+                None => die_usage("--config wymaga ścieżki"),
+            },
+            // Obie formy zapisu: "=LISTA" (czytelna, bo widać, że wartość
+            // należy do flagi) i "FLAGA LISTA" (jak --config PLIK, więc nie
+            // zaskakuje). Rozdzielenie ich byłoby czystym utrudnieniem.
+            s if s.starts_with(&format!("{}=", experimental::FLAG)) => {
+                let spec = &s[experimental::FLAG.len() + 1..];
+                if let Err(e) = experimental.extend_from_spec(spec) {
+                    die_usage(&e);
                 }
+            }
+            s if s == experimental::FLAG => match args.next() {
+                Some(spec) => {
+                    if let Err(e) = experimental.extend_from_spec(&spec) {
+                        die_usage(&e);
+                    }
+                }
+                None => die_usage(&format!("{} wymaga listy opcji", experimental::FLAG)),
             },
             "-v" | "--verbose" => verbose = true,
             "-h" | "--help" => {
-                print!("{USAGE}");
+                print!("{}", usage());
                 return;
             }
-            other => {
-                eprintln!("nieznany argument: {other}\n\n{USAGE}");
-                std::process::exit(2);
-            }
+            other => die_usage(&format!("nieznany argument: {other}")),
         }
     }
 
@@ -67,8 +94,8 @@ fn main() {
 
     let result = match cmd.as_str() {
         "devices" => cmd_devices(),
-        "check" => cmd_check(&config_path),
-        _ => cmd_run(&config_path),
+        "check" => cmd_check(&config_path, &experimental),
+        _ => cmd_run(&config_path, &experimental),
     };
     if let Err(e) = result {
         log::error!("{e:#}");
@@ -76,8 +103,17 @@ fn main() {
     }
 }
 
-fn cmd_run(config_path: &PathBuf) -> Result<()> {
-    let cfg = Config::load(config_path)?;
+fn cmd_run(config_path: &PathBuf, experimental: &experimental::Selection) -> Result<()> {
+    let mut cfg = Config::load(config_path)?;
+    // opcje eksperymentalne nakładamy na WCZYTANĄ konfigurację — dalej cały
+    // tor AI widzi zwykły Config i nie zna pojęcia flagi
+    experimental.apply(&mut cfg);
+    experimental.log_startup();
+    // strojenie sprawdzamy PO nałożeniu opcji — inaczej nie wiadomo, którego
+    // toru dotyczy wartość z pliku
+    if let Some(w) = cfg.tuning_warning() {
+        log::warn!("{w}");
+    }
 
     // ringbuffery RT ↔ tor AI
     let (cap_prod, cap_cons) = HeapRb::<f32>::new(pw::RATE as usize * 4).split(); // mono, 4 s
@@ -141,11 +177,11 @@ fn check_item(failures: &mut usize, cond: bool, msg_ok: String, msg_err: String)
     }
 }
 
-fn cmd_check(config_path: &PathBuf) -> Result<()> {
+fn cmd_check(config_path: &PathBuf, experimental: &experimental::Selection) -> Result<()> {
     let mut failures = 0usize;
 
     println!("konfiguracja: {}", config_path.display());
-    let cfg = match Config::load(config_path) {
+    let mut cfg = match Config::load(config_path) {
         Ok(c) => c,
         Err(e) => {
             println!("  BŁĄD  {e:#}");
@@ -156,6 +192,21 @@ fn cmd_check(config_path: &PathBuf) -> Result<()> {
         println!("  OK    składnia poprawna");
     } else {
         println!("  OK    brak pliku — używam domyślnej konfiguracji");
+    }
+
+    // Opcje eksperymentalne zawsze jako OK (nieznana nazwa nie dochodzi tu
+    // wcale — parser kończy proces kodem 2), ale WYPISANE, żeby `check`
+    // pokazywał ten sam tor, którym pojedzie `run` z tymi samymi argumentami.
+    experimental.apply(&mut cfg);
+    if experimental.is_empty() {
+        println!("  OK    opcje eksperymentalne: brak (włącza je {}=…)", experimental::FLAG);
+    } else {
+        println!("  OK    opcje eksperymentalne: {}", experimental.names().join(", "));
+    }
+    // UWAGA, nie BŁĄD: konfiguracja jest poprawna, tylko dostrojona pod drugi
+    // tor — nie ma powodu, żeby przez to zwracać kod wyjścia 1
+    if let Some(w) = cfg.tuning_warning() {
+        println!("  UWAGA {w}");
     }
 
     // model whisper

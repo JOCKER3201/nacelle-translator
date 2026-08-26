@@ -36,6 +36,26 @@ dip_threshold = 0.6      # próg dołka dla tego cięcia — luźniejszy niż th
                          # bo pod muzyką p nie schodzi nisko nawet na granicach fraz
 soft_max_ms = 2000       # od tej długości: (1) szukamy dołka do cięcia,
                          # (2) obowiązuje soft_hangover_ms zamiast hangover_ms
+                         #
+                         # NIEZMIENNIK: hard_max_ms - soft_max_ms >= 2000.
+                         # Cięcie w ustabilizowanym dołku może odpalić najwcześniej
+                         # w chwili soft_max_ms, więc okno wyścigu do twardego
+                         # cięcia to dokładnie ta różnica; zejście poniżej niej
+                         # zamienia cięcia w dołku (dobra granica frazy) na cięcia
+                         # twarde, w połowie słowa. Pomiar: p95 czekania na dołek
+                         # to 1.60 s od soft_max, więc 2.0 s zostawia 0.4 s zapasu.
+                         #
+                         # Tu 2000, bo szablon zakłada uruchomienie BEZ opcji
+                         # eksperymentalnych: bez spekulacyjnego STT nic nie
+                         # wychodzi z segmentera przed domknięciem segmentu,
+                         # więc soft_max jest wprost opóźnieniem pierwszych słów.
+                         # Uruchamiając z --experimental-features=speculative-stt
+                         # opłaca się 6000 — niskie opóźnienie dają wtedy
+                         # fragmenty, a final może poczekać na pełniejsze zdanie
+                         # i dać tłumaczowi lepszy kontekst. Wartość powyżej
+                         # 3000 na torze BEZ spekulacji program zgłasza linią
+                         # WARN na starcie (i w `check`), bo to najczęstszy
+                         # sposób, w jaki plik zostaje po drugim wariancie.
 hard_max_ms = 8000       # twarde cięcie ciągłej mowy — sufit awaryjny, gdy nie
                          # trafi się żadna pauza ani dołek
 overlap_ms = 250         # nakładka przenoszona po wymuszonym cięciu
@@ -44,6 +64,21 @@ overlap_ms = 250         # nakładka przenoszona po wymuszonym cięciu
 model = "models/ggml-small.bin"  # model WIELOJĘZYCZNY (nie *.en!)
 language = "auto"                # albo kod źródłowy na sztywno, np. "en"
 threads = 8                      # rdzenie fizyczne; SMT często szkodzi ggml
+# UWAGA: spekulacyjnego STT NIE MA tu klucza — jest funkcją eksperymentalną
+# i włącza je wyłącznie flaga wiersza poleceń:
+#     nacelle-translator --experimental-features=speculative-stt
+# (whisper puszczany co cadence_ms CZASU AUDIO na rosnącym, OTWARTYM segmencie;
+# stabilny prefiks dwóch zgodnych przebiegów, LocalAgreement-2, idzie do
+# tłumaczenia od razu, a final domyka tylko niewyemitowany ogon — niższe
+# opóźnienie pierwszych słów kosztem dodatkowych przebiegów whispera).
+# Poniższe trzy klucze STROJĄ tę funkcję i bez flagi są nieużywane.
+cadence_ms = 400                 # kadencja przebiegów częściowych [ms CZASU AUDIO — liczona
+                                 # chunkami segmentera po 32 ms, nie zegarem ściennym]
+min_open_ms = 1500               # poniżej tej długości otwartego bufora nie spekulujemy: pad
+                                 # zerowy whispera (~1,1 s) daje na krótkim audio skorelowane
+                                 # halucynacje, które wyglądałyby na "stabilne"
+min_fragment_chars = 12          # minimalna długość fragmentu w znakach (do interpunkcji
+                                 # frazowej); krótsze fragmenty czekają na kolejny przebieg
 
 [translate]
 # "gemini" (domyślny, API w chmurze) | "ollama" (lokalny model przez Ollamę
@@ -68,10 +103,40 @@ ollama_timeout_s = 60            # timeout dla silnika "ollama" (lokalny model b
 [tts]
 piper_bin = "~/.local/share/piper/piper/piper"
 voice = "~/.local/share/piper/pl_PL-gosia-medium.onnx"
-length_scale = 0.68             # <1.0 = szybsza mowa; agresywnie, bo TranslateGemma tłumaczy rozwlekle
-catchup_length_scale = 0.55      # tempo doganiania: gdy zadanie ma >2s zaległości (rozwlekłe
-                                 # tłumaczenie wydłużyło kolejkę), lektor chwilowo przyspiesza
-                                 # dłuższy od angielskiego — lektor MUSI mówić szybciej
-                                 # niż oryginał, inaczej kolejka odtwarzania stale rośnie
+length_scale = 0.68             # <1.0 = szybsza mowa. Wartość dobrana ODSŁUCHEM —
+                                 # przy tempie lektora to kryterium bije rachunek.
+                                 # Próbowano 0.60 (wychodziło z bilansu czasu mowy):
+                                 # zmierzone 20.7 zn/s wobec 17.8 zn/s przy 0.68, czyli
+                                 # 16 % szybciej — odrzucone jako pośpieszne.
+                                 #
+                                 # ŚWIADOMY KOSZT przy materiale bez pauz (mowa ciągła):
+                                 # polskie wyjście ma ekspansję ~1.21 w znakach, więc
+                                 # zmieszczenie się w materiale wymagałoby ~19.75 zn/s.
+                                 # Przy 0.68 obciążenie kanału lektora sięga ~106 % i tryb
+                                 # doganiania staje się WARUNKIEM DZIAŁANIA (~51 % klipów),
+                                 # a nie rezerwą: opóźnienie ustala się na ~6.5 s i po końcu
+                                 # materiału zostaje ~10 s ogona. Przy materiale z pauzami
+                                 # kolejka nadrabia i nic z tego nie słychać.
+                                 #
+                                 # Model do przeliczeń: 0.68 -> ~106 %, 0.63 -> ~99 %,
+                                 # 0.60 -> ~95 %, 0.55 -> ~89 %. Obciążenia NIE zbija się
+                                 # już tempem — próg akceptowalności odsłuchu leży wyżej
+                                 # niż próg wydolności kanału. Właściwy kierunek to
+                                 # skrócenie tekstu wyjściowego, nie przyspieszanie lektora.
+                                 # ZASTRZEŻENIE: te zn/s zmierzono dla głosu pl_PL-*-medium
+                                 # i pary EN->PL. To NIE jest uniwersalna stała — dla innego
+                                 # głosu i innej pary językowej ekspansję i przepustowość
+                                 # trzeba przemierzyć od nowa.
+                                 # NIEZMIENNIK: catchup_length_scale <= length_scale
+                                 # (równe = doganianie wyłączone).
+catchup_length_scale = 0.55      # tempo doganiania: gdy zadanie ma >1 s zaległości
+                                 # (CATCHUP_AFTER w pipeline.rs) albo tłumaczenie jest
+                                 # rozdęte, lektor chwilowo przyspiesza. Tłumaczenie bywa
+                                 # dłuższe od oryginału — lektor MUSI mówić szybciej
+                                 # niż mówca, inaczej kolejka odtwarzania stale rośnie.
+                                 # Zysk doganiania to +15.2 % przepustowości
+                                 # (18.92 -> 21.80 zn/s), a NIE +23.6 % z ilorazu
+                                 # 0.68/0.55: stały narzut ciszy pipera (~0.33 s na klip)
+                                 # nie skaluje się z length_scale.
 sentence_silence = 0.05          # cisza po każdym zdaniu [s]
 work_dir = "/dev/shm/nacelle-translator-tts"  # tmpfs — zero realnego I/O

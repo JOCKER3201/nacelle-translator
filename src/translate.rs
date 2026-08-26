@@ -323,6 +323,105 @@ pub struct LlamaCppTranslator {
     history: VecDeque<(String, String, String)>,
 }
 
+/// Zwija warianty rodzajowe zapisane ukośnikiem ("pewien/pewna") do
+/// PIERWSZEGO wariantu. Piper fonemizuje przez espeak-ng, a ten czyta '/'
+/// między literami jako angielskie "slash" — zweryfikowane fonemizatorem:
+/// "Nie jestem pewien/pewna w tej chwili." daje segment sl'ES, czyli lektor
+/// dosłownie wypowiedział "pewien SLASZ pewna". Skala: 1 wystąpienie na 180
+/// wyjść MT w sesji audytu.
+///
+/// Warunki zwinięcia (WSZYSTKIE muszą być spełnione) — dobrane tak, żeby
+/// legalne zapisy techniczne przechodziły NIETKNIĘTE:
+///  * po obu stronach ukośnika wyłącznie litery (`char::is_alphabetic`),
+///  * oba biegi są całymi słowami: znak przed lewym i po prawym nie jest
+///    alfanumeryczny (odsiewa "2.5Gb/s", "5GB/GBps"),
+///  * wspólny prefiks >= 3 ZNAKÓW (nie bajtów!), bez rozróżniania wielkości
+///    liter — odsiewa "Gb/s", "WAN/LAN", "km/h", "wejście/wyjście" (prefiks 1),
+///  * długości wariantów różnią się najwyżej o 2 znaki,
+///  * ŻADEN bieg nie jest prefiksem drugiego — odsiewa akronim i jego
+///    rozszerzenie ("HTTP/HTTPS", "USB/USBC", "PoE/PoE+"), które oba warunki
+///    wyżej przechodzą, a zwinięcie kosztowałoby połowę treści merytorycznej.
+///
+/// Znany, ZAAKCEPTOWANY fałszywy alarm: "przed/przez" (wspólny prefiks
+/// "prze"). Przy jednym ukośniku na całą 7-minutową sesję to koszt pomijalny.
+///
+/// NIE rozszerzać na cudzysłowy ani nawiasy: zweryfikowane espeakiem, że
+/// cudzysłowy (proste i drukarskie) NIE dają ŻADNYCH fonemów — espeak
+/// traktuje je jak przecinek. Taki kod byłby czystym długiem bez efektu.
+fn collapse_variant_slashes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    // przesunięcie w WYJŚCIU, od którego ciągną się litery bieżącego słowa;
+    // None = nie ma otwartego słowa albo ciąg liter zaczął się po cyfrze
+    // (wtedy nie jest CAŁYM słowem, więc "2.5Gb/s" się nie kwalifikuje)
+    let mut word_start: Option<usize> = None;
+    let mut prev_alnum = false;
+
+    let mut it = s.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        if c == '/' {
+            let rest = &s[i + c.len_utf8()..];
+            let right_len = rest
+                .find(|ch: char| !ch.is_alphabetic())
+                .unwrap_or(rest.len());
+            // prawy bieg też musi kończyć słowo — inaczej "5GB/GBps"
+            let boundary_ok = rest[right_len..]
+                .chars()
+                .next()
+                .map_or(true, |ch| !ch.is_alphanumeric());
+            let collapse = right_len > 0
+                && boundary_ok
+                && word_start.is_some_and(|w| same_variant(&out[w..], &rest[..right_len]));
+            if collapse {
+                // zjedz prawy wariant razem z ukośnikiem; iterujemy po ZNAKACH,
+                // bo polskie diakrytyki mają po 2 bajty
+                for _ in 0..rest[..right_len].chars().count() {
+                    it.next();
+                }
+            } else {
+                out.push(c);
+            }
+            word_start = None;
+            prev_alnum = false;
+            continue;
+        }
+        if c.is_alphabetic() {
+            if word_start.is_none() && !prev_alnum {
+                word_start = Some(out.len());
+            }
+            prev_alnum = true;
+        } else {
+            word_start = None;
+            prev_alnum = c.is_alphanumeric();
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Czy `left` i `right` to dwa warianty fleksyjne tego samego słowa.
+/// Wszystko liczone w ZNAKACH, nie bajtach — "żółty/żółta" ma 5 znaków,
+/// ale 7 bajtów, a cięcie po bajtach panikowałoby na granicy diakrytyku.
+fn same_variant(left: &str, right: &str) -> bool {
+    let (ln, rn) = (left.chars().count(), right.chars().count());
+    if ln.abs_diff(rn) > 2 {
+        return false;
+    }
+    let common = left
+        .chars()
+        .flat_map(char::to_lowercase)
+        .zip(right.chars().flat_map(char::to_lowercase))
+        .take_while(|(a, b)| a == b)
+        .count();
+    // Wariant fleksyjny różni się KOŃCÓWKĄ, więc żaden bieg nie jest prefiksem
+    // drugiego ("pewien"/"pewna" rozjeżdżają się na 4. znaku). Akronim i jego
+    // rozszerzenie są dokładnie odwrotne: "HTTP"/"HTTPS", "USB"/"USBC",
+    // "PoE"/"PoE+" mają wspólny prefiks równy krótszemu biegowi i sam warunek
+    // >= 3 znaków ich NIE odsiewa — a materiał, na którym ten sanitizer ma
+    // działać, to recenzja sprzętu sieciowego, gdzie taka para jest treścią
+    // merytoryczną, nie ozdobnikiem. Zwinięcie usunęłoby połowę informacji.
+    common >= 3 && common < ln.min(rn)
+}
+
 /// Angielska nazwa języka do promptu TranslateGemma ("en" → "English").
 /// Kody i nazwy pochodzą z tablicy whispera — dokładnie tego zbioru używa
 /// nasza detekcja języka, więc każdy kod, który tu trafia, ma nazwę.
@@ -399,6 +498,44 @@ impl LlamaCppTranslator {
         p
     }
 
+    /// Polityka kontekstu przed złożeniem promptu.
+    ///
+    /// Prefiks promptu musi być append-only między resetami, żeby cache_prompt
+    /// llama-servera trafiał (rolowanie okna przez pop_front co turę zmieniałoby
+    /// prefiks przy KAŻDEJ turze i wymuszało pełny reprocessing). Ale twardy
+    /// clear() płacił za to zbyt drogo: pomiar audytu na 180 turach dał rozkład
+    /// głębokości historii 60/60/60 przy hist_len 0/1/2 — DOKŁADNIE 1/3
+    /// tłumaczeń szła z pustym kontekstem, i to na tych turach wypadły oba
+    /// najcięższe błędy znaczeniowe sesji ("a crapload of ventilation" ->
+    /// "Bardzo słabe wentylacja"; poprzednia tura kończyła się na "...robust
+    /// built device with a", czyli zawierała jedyny dysambiguator idiomu,
+    /// i została wyrzucona 100 ms wcześniej). Z 10 skatalogowanych wpadek MT:
+    /// 5 przy hist_len=0, 5 przy hist_len=1, ZERO przy hist_len=2.
+    ///
+    /// Dlatego przy resecie zostawiamy OSTATNIĄ parę. Musi zostać na PRZODZIE
+    /// kolejki, przed pierwszą nową turą — inaczej prefiks przestaje być
+    /// append-only i cache pada całkowicie. Dowód, że po tej zmianie prefiks
+    /// nadal tylko rośnie MIĘDZY resetami: build_prompt składa historię
+    /// w kolejności kolejki, a po udanej turze dokładamy jej parę przez
+    /// push_back z DOKŁADNIE tym samym (src_code, text), z których zbudowano
+    /// prompt — więc prompt tury n+1 to prompt tury n plus doklejone
+    /// "<odpowiedź n><end_of_turn>\n" i nowa tura user. Turę, w której
+    /// pop_front faktycznie zadziała, płacimy jednym chybieniem cache
+    /// (mediana MT 76 ms, suma 16 s na 7 minut). Zapas jest: kontekst nigdy
+    /// nie przekroczył 338 tokenów przy n_ctx_slot=131072.
+    ///
+    /// Degeneraty context_pairs 0 i 1 zachowują dotychczasowe zachowanie
+    /// (pusta historia) — przy jednej parze nie ma "ostatniej pary"
+    /// do zachowania.
+    fn trim_history(&mut self) {
+        let keep = usize::from(self.cfg.context_pairs >= 2);
+        if self.history.len() >= self.cfg.context_pairs {
+            while self.history.len() > keep {
+                self.history.pop_front();
+            }
+        }
+    }
+
     fn call_once(&self, body: &Value) -> std::result::Result<Value, ureq::Error> {
         let url = format!("{}/completion", self.cfg.llamacpp_host.trim_end_matches('/'));
         self.agent
@@ -437,15 +574,7 @@ impl Translator for LlamaCppTranslator {
             "en"
         };
 
-        // Prefiks promptu musi być append-only między resetami, żeby
-        // cache_prompt llama-servera trafiał: rolowanie okna (pop_front)
-        // zmieniało prefiks przy KAŻDEJ turze i wymuszało pełny reprocessing
-        // promptu. Pełny reset co context_pairs tur (jak łańcuch Gemini)
-        // kosztuje chwilową utratę kontekstu raz na kilka tur, ale między
-        // resetami prompt tylko rośnie i cache działa.
-        if self.history.len() >= self.cfg.context_pairs {
-            self.history.clear();
-        }
+        self.trim_history();
 
         // n_predict proporcjonalny do wejścia zamiast globalnego max_tokens:
         // na zniekształconej transkrypcji model potrafi halucynować rozdęte,
@@ -476,6 +605,10 @@ impl Translator for LlamaCppTranslator {
                 resp["stop_type"]
             );
         }
+
+        // sanityzacja przed TTS i przed wpisem do historii — jedno źródło
+        // prawdy: model widzi w kontekście dokładnie to, co usłyszał słuchacz
+        let translated = collapse_variant_slashes(&translated);
 
         self.history
             .push_back((src_code.to_string(), text.to_string(), translated.clone()));
@@ -631,5 +764,162 @@ pub fn make_translator(cfg: &MtCfg) -> Result<Box<dyn Translator>> {
         other => bail!(
             "nieznany silnik tłumaczenia: {other} (dozwolone: gemini, ollama, llamacpp, claude, off)"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- rekomendacja 9: sanitizer ukośnika ----------
+
+    // TR1: wzorzec, który faktycznie wystąpił w logu (#63.0) — espeak-ng
+    // fonemizował '/' jako sl'ES, więc lektor powiedział "pewien SLASZ pewna"
+    #[test]
+    fn tr1_ukosnik_wariantu_rodzajowego_zwiniety() {
+        assert_eq!(
+            collapse_variant_slashes("Nie jestem pewien/pewna w tej chwili."),
+            "Nie jestem pewien w tej chwili."
+        );
+    }
+
+    // TR2: zapisy techniczne z materiału audytu MUSZĄ przejść nietknięte —
+    // to one decydują o tym, że sanitizer jest bezpieczny na tej domenie
+    #[test]
+    fn tr2_zapisy_techniczne_nietkniete() {
+        for s in [
+            "2.5 Gb/s",
+            "WAN/LAN",
+            "24/7",
+            "km/h",
+            "2.5Gb/s",
+            "wejście/wyjście",
+            "AdGuard/OpenWRT",
+            "Wi-Fi 7 / MLO",
+            "5GB/GBps",
+            // akronim + rozszerzenie: różnica długości <= 2 i wspólny prefiks
+            // >= 3 SPEŁNIONE, odsiewa je dopiero warunek "żaden bieg nie jest
+            // prefiksem drugiego". Bez niego "HTTP/HTTPS" czytało się "HTTP".
+            "HTTP/HTTPS",
+            "USB/USBC",
+            "PoE/PoE+",
+        ] {
+            assert_eq!(collapse_variant_slashes(s), s, "zmieniono: {s}");
+        }
+    }
+
+    // TR3: wielkość liter nie może psuć porównania prefiksu — MT kapitalizuje
+    // pierwszy wariant na początku zdania; różnica długości 1 znaku mieści się
+    // w limicie 2
+    #[test]
+    fn tr3_dlugie_warianty_i_wielkosc_liter() {
+        assert_eq!(
+            collapse_variant_slashes("Zainteresowany/zainteresowana tym tematem."),
+            "Zainteresowany tym tematem."
+        );
+        assert_eq!(collapse_variant_slashes("Pewien/pewna."), "Pewien.");
+    }
+
+    #[test]
+    fn tr4_wiele_ukosnikow_w_jednym_zdaniu() {
+        assert_eq!(
+            collapse_variant_slashes("Jestem pewien/pewna i zmęczony/zmęczona."),
+            "Jestem pewien i zmęczony."
+        );
+    }
+
+    // TR5: ukośnik bez pełnego słowa po którejś stronie — brak reguły,
+    // brak zmiany (i przede wszystkim brak paniki na indeksowaniu)
+    #[test]
+    fn tr5_ukosnik_na_brzegu_bez_liter() {
+        for s in ["/start", "koniec/", "a / b", "//", "/", ""] {
+            assert_eq!(collapse_variant_slashes(s), s, "zmieniono: {s}");
+        }
+    }
+
+    // TR6: udokumentowany, świadomie zaakceptowany fałszywy alarm — patrz doc
+    // funkcji. Przy jednym ukośniku na 180 wyjść MT koszt jest pomijalny,
+    // ale ma być utrwalony testem, żeby nie był niespodzianką.
+    #[test]
+    fn tr6_znany_falszywy_alarm_przed_przez() {
+        assert_eq!(collapse_variant_slashes("przed/przez"), "przed");
+    }
+
+    // TR7: dowód, że cięcie idzie po granicach ZNAKÓW, nie bajtów —
+    // "żółty" to 5 znaków i 8 bajtów; cięcie po bajtach paniką by wybuchło
+    #[test]
+    fn tr7_diakrytyki_utf8_bez_paniki() {
+        assert_eq!(collapse_variant_slashes("żółty/żółta"), "żółty");
+        assert_eq!(
+            collapse_variant_slashes("Ona jest zmęczona/zmęczony, prawda?"),
+            "Ona jest zmęczona, prawda?"
+        );
+    }
+
+    // ---------- rekomendacja 5: polityka kontekstu MT ----------
+
+    /// Translator bez sieci: `LlamaCppTranslator::new` robi llamacpp_check po
+    /// HTTP, a nas interesuje wyłącznie polityka historii i składanie promptu.
+    fn llama(context_pairs: usize) -> LlamaCppTranslator {
+        LlamaCppTranslator {
+            cfg: MtCfg {
+                context_pairs,
+                ..MtCfg::default()
+            },
+            agent: ureq::AgentBuilder::new().build(),
+            history: VecDeque::new(),
+        }
+    }
+
+    fn pusc_ture(tr: &mut LlamaCppTranslator, n: usize) {
+        tr.history
+            .push_back(("en".into(), format!("source {n}"), format!("źródło {n}")));
+    }
+
+    // TR8: reset zostawia OSTATNIĄ parę (nie pierwszą) — to ona niesie
+    // dysambiguator dla następnej tury; w sesji audytu 1/3 tłumaczeń szła
+    // z pustym kontekstem i tam wypadło 5 z 10 wpadek MT
+    #[test]
+    fn tr8_reset_zachowuje_ostatnia_pare() {
+        let mut tr = llama(3);
+        for n in 1..=3 {
+            pusc_ture(&mut tr, n);
+        }
+        tr.trim_history();
+        assert_eq!(tr.history.len(), 1);
+        assert_eq!(tr.history[0].1, "source 3");
+    }
+
+    // TR9: warunek konieczny z raportu — po resecie prefiks promptu dalej
+    // tylko rośnie, więc cache_prompt llama-servera trafia od następnej tury
+    #[test]
+    fn tr9_prefiks_promptu_zostaje_append_only() {
+        let mut tr = llama(3);
+        for n in 1..=3 {
+            pusc_ture(&mut tr, n);
+        }
+        tr.trim_history();
+
+        let p1 = tr.build_prompt("en", "t1");
+        tr.history
+            .push_back(("en".into(), "t1".into(), "r1".into()));
+        let p2 = tr.build_prompt("en", "t2");
+
+        assert!(
+            p2.starts_with(&p1),
+            "prompt przestał być append-only:\n--- p1 ---\n{p1}\n--- p2 ---\n{p2}"
+        );
+    }
+
+    // TR10: przy context_pairs 0 i 1 nie ma "ostatniej pary" do zachowania —
+    // semantyka konfiguracji zostaje dokładnie taka, jak przy dawnym clear()
+    #[test]
+    fn tr10_degeneraty_context_pairs() {
+        for cp in [0, 1] {
+            let mut tr = llama(cp);
+            pusc_ture(&mut tr, 1);
+            tr.trim_history();
+            assert!(tr.history.is_empty(), "context_pairs={cp}");
+        }
     }
 }
