@@ -19,6 +19,10 @@ pub const LOCK_MIN_PROB: f32 = 0.8;
 const ANCHOR_K: usize = 3;
 /// M3: dopasowanie edycyjne ostatnich M scommitowanych słów
 const ANCHOR_M: usize = 4;
+/// co ile resynchronizacji licznika podnosić diagnostykę z DEBUG do INFO —
+/// w całym 7-minutowym logu audytu było 0 linii DEBUG, więc rozjazdy kotwicy
+/// trzeba było wnioskować pośrednio z niezmienników kodu zamiast czytać z logu
+const RESYNC_LOG_EVERY: u64 = 10;
 /// interpunkcja frazowa whispera — jedyne dozwolone miejsca cięcia fragmentu
 const PHRASE_PUNCT: &[char] = &['.', ',', '!', '?', ';'];
 
@@ -147,6 +151,14 @@ pub struct SpeculativeTracker {
     // liczniki diagnostyczne (logowane przez pipeline)
     pub reanchors: u64,
     pub lost_tails: u64,
+    /// resync przesunął licznik W PRZÓD (hipoteza urosła / przesunęła się
+    /// w prawo) — nieszkodliwe
+    pub resyncs_up: u64,
+    /// resync COFNĄŁ licznik — każdy taki przypadek to GWARANTOWANY duplikat
+    /// u lektora; to jest KPI rekomendacji 3. Część cofnięć jest legalna:
+    /// rewizja scalająca "it is"->"it's" skraca prefiks (T14), więc licznik
+    /// nie ma spaść do zera, tylko wyraźnie w dół
+    pub resyncs_down: u64,
 }
 
 impl SpeculativeTracker {
@@ -164,6 +176,8 @@ impl SpeculativeTracker {
             min_fragment_chars,
             reanchors: 0,
             lost_tails: 0,
+            resyncs_up: 0,
+            resyncs_down: 0,
         }
     }
 
@@ -226,6 +240,57 @@ impl SpeculativeTracker {
         None
     }
 
+    /// Wariant kotwiczenia dla OKNA LICZNIKOWEGO ±ANCHOR_K: najpierw przebieg
+    /// z tol=0 i len=m (dopasowanie IDEALNE po tym samym zakresie okien),
+    /// dopiero potem obecna pętla rozmyta.
+    ///
+    /// DLACZEGO: dla kotwicy 4-słowowej okno przesunięte o JEDNO słowo ma
+    /// odległość Levenshteina dokładnie 2 (jedno usunięcie + jedno wstawienie),
+    /// a tol dla m >= ANCHOR_M wynosi 2 — więc fałszywe okno ZAWSZE mieści się
+    /// w tolerancji, a że jest skanowane wcześniej, ZAWSZE wygrywa z prawdziwym.
+    /// Licznik committed cofa się i lektor powtarza wypowiedziane już słowa
+    /// (audyt: 9 par fragmentów + ~11 ogonów finali = ~26 słów = 1,9 % tekstu
+    /// do MT; #43 "ventilation" dwa razy, #69 "below in the comments" TRZY razy
+    /// w ciągu 4 sekund). Defekt jest lepki: po cofnięciu anchor_exact_at
+    /// przestaje trafiać i pętla rozmyta bez końca potwierdza złą pozycję —
+    /// przebieg tol=0 wyprowadza tracker z tego stanu.
+    ///
+    /// ZAKRES CELOWO OGRANICZONY do okna ±ANCHOR_K. Na wywołaniach z PEŁNĄ
+    /// listą (on_final: 0..f.len()) preferencja idealnego dopasowania jest
+    /// ZAKAZANA — przy powtarzalnych frazach ("all the way ... all the way up
+    /// again") późniejsze dopasowanie idealne pobiłoby wcześniejsze prawdziwe
+    /// z d=1 i emisja przeskoczyłaby całe zdanie (zweryfikowany ubytek 8 słów,
+    /// pilnuje tego T20).
+    ///
+    /// Bilans najgorszego przypadku: ubytek względem obecnego kodu jest
+    /// ograniczony zakresem okna do 2*ANCHOR_K + 1 = 7 słów i wymaga, żeby
+    /// IDENTYCZNY 4-gram powtórzył się w promieniu 3 słów od kotwicy — w całej
+    /// analizowanej sesji taki układ nie wystąpił ani razu.
+    fn find_anchor_windowed(&self, words: &[Word], w_lo: usize, w_hi: usize) -> Option<usize> {
+        let m = self.committed_tail.len();
+        if m > 0 {
+            for w in w_lo..w_hi.min(words.len()) {
+                // okno MUSI mieścić się w całości: obcięte na końcu listy nie
+                // jest "dopasowaniem idealnym" (final krótszy niż committed —
+                // T12 ma spaść na pętlę rozmytą, nie na fałszywe trafienie)
+                if w + m > words.len() {
+                    break;
+                }
+                if words[w..w + m]
+                    .iter()
+                    .zip(self.committed_tail.iter())
+                    .all(|(x, a)| x.norm == *a)
+                {
+                    // reguła "najwcześniejszy start wygrywa przy remisie"
+                    // zachowana: skan idzie od w_lo w górę i zwraca PIERWSZE
+                    // trafienie idealne
+                    return Some(w + m);
+                }
+            }
+        }
+        self.find_anchor(words, w_lo, w_hi)
+    }
+
     /// M3 dla przebiegów częściowych: committed jest licznikiem w jednostkach
     /// pozycji hipotezy Z CHWILI COMMITU — weryfikacja kotwicy na BIEŻĄCEJ
     /// hipotezie zwraca licznik w jej jednostkach (dokładne trafienie
@@ -238,7 +303,7 @@ impl SpeculativeTracker {
         let base = self.committed.saturating_sub(self.committed_tail.len());
         let w_lo = base.saturating_sub(ANCHOR_K);
         let w_hi = base + ANCHOR_K + 1;
-        self.find_anchor(&self.last_words, w_lo, w_hi)
+        self.find_anchor_windowed(&self.last_words, w_lo, w_hi)
             .map(|e| e.min(self.last_words.len()))
     }
 
@@ -294,6 +359,23 @@ impl SpeculativeTracker {
                         "spekulacja: gen {gen} resync licznika {} → {c} po rewizji hipotezy",
                         self.committed
                     );
+                    if c > self.committed {
+                        self.resyncs_up += 1;
+                    } else {
+                        self.resyncs_down += 1;
+                    }
+                    // DEBUG jest w praktyce niewidoczny (0 linii DEBUG w całym
+                    // logu audytu), a resync w dół to jedyny obserwowalny ślad
+                    // duplikatu u lektora — okresowe INFO jest KPI rekomendacji 3
+                    let total = self.resyncs_up + self.resyncs_down;
+                    if total % RESYNC_LOG_EVERY == 0 {
+                        log::info!(
+                            "spekulacja: resyncy licznika kotwicy — {} w górę, {} w dół \
+                             (każdy w dół = powtórka u lektora)",
+                            self.resyncs_up,
+                            self.resyncs_down
+                        );
+                    }
                     self.committed = c;
                 }
                 Some(_) => {}
@@ -399,7 +481,7 @@ impl SpeculativeTracker {
             let matched = if counter_valid {
                 // M3: okno licznikowe ±k (absorbuje też przesunięcie o 1
                 // słowo po deduplikacji szwu)
-                self.find_anchor(&f, base.saturating_sub(ANCHOR_K), base + ANCHOR_K + 1)
+                self.find_anchor_windowed(&f, base.saturating_sub(ANCHOR_K), base + ANCHOR_K + 1)
                     .or_else(|| {
                         // dryf licznika ponad ±k (skumulowane rewizje
                         // zmniejszające liczbę słów przed granicą): zanim
@@ -730,6 +812,11 @@ mod tests {
         // rewizja scalona: jedno słowo mniej przed granicą; resync 5 → 4,
         // LCP ze starą hipotezą za mały na emisję
         assert!(tr.on_partial(1, "I think it's red, and then we go").is_none());
+        // kanarek uzasadnionego resyncu W DÓŁ: kotwica ["think","it","is","red"]
+        // nie ma dopasowania DOKŁADNEGO w "I think it's red..." (normalize("it's")
+        // == "its"), więc przebieg tol=0 nic nie znajduje i sterowanie spada na
+        // pętlę rozmytą — legalne cofnięcia licznika mają dalej działać
+        assert_eq!(tr.resyncs_down, 1);
         // brak interpunkcji frazowej w stabilnej części ("home." poza LCP)
         assert!(tr
             .on_partial(1, "I think it's red, and then we go home.")
@@ -822,5 +909,88 @@ mod tests {
         assert!(emit.reanchored);
         // start = committed(4) − k(3) = 1 → duplikat, nigdy ubytek
         assert_eq!(emit.text, "different words here, more still.");
+    }
+
+    // T19: REGRESJA Z AUDYTU (#69, 20 s przed końcem filmu). Whisper wstawia
+    // słowo PRZED granicą commitu ("see more of" → "see more of it"), przez co
+    // anchor_exact_at chybia, a okno przesunięte o jedno słowo ma odległość
+    // edycyjną dokładnie 2 = tol dla kotwicy 4-słowowej. PRZED poprawką pętla
+    // rozmyta dopasowywała ["it","in","the","review"] do kotwicy
+    // ["below","in","the","comments"] i cofała licznik 10 → 7, więc krok D
+    // emitował "below in the comments. I probably will post this on Reddit."
+    // — dokładnie duplikat z logu (09:13:44.556, ta sama fraza po raz trzeci
+    // w 4 sekundy). Przebieg tol=0 znajduje kotwicę na przesuniętej pozycji.
+    #[test]
+    fn t19_rewizja_w_prawo_nie_cofa_licznika() {
+        let mut tr = tracker();
+        assert!(tr
+            .on_partial(1, "see more of in the review below in the comments. I")
+            .is_none());
+        let frag = tr
+            .on_partial(1, "see more of in the review below in the comments. I probably")
+            .expect("stabilny prefiks cięty na kropce");
+        assert_eq!(frag.text, "see more of in the review below in the comments.");
+        assert_eq!(frag.new_committed, 10);
+        tr.commit(&frag); // kotwica = [below, in, the, comments]
+
+        // rewizja: whisper dokleja "it" przed granicą commitu; LCP=3 <=
+        // committed, więc ten przebieg i tak nic nie emituje — liczy się
+        // wyłącznie skutek uboczny na liczniku
+        let revised =
+            "see more of it in the review below in the comments. I probably will post this on Reddit. So";
+        assert!(tr.on_partial(1, revised).is_none());
+        assert_eq!(tr.resyncs_up, 1);
+        assert_eq!(tr.resyncs_down, 0);
+
+        let frag = tr
+            .on_partial(1, revised)
+            .expect("dwa zgodne przebiegi w nowej formie");
+        assert_eq!(frag.text, "I probably will post this on Reddit.");
+        assert_eq!(tr.resyncs_up, 1);
+        assert_eq!(tr.resyncs_down, 0);
+    }
+
+    // T20: REGRESJA PRZECIW NAIWNEJ WERSJI REKOMENDACJI 3 — literalny
+    // kontrprzykład z audytu. Ścieżka PEŁNOLISTOWA (coalesced=2 ⇒
+    // counter_valid=false) MUSI dalej wybierać NAJWCZEŚNIEJSZE okno poniżej
+    // progu: prawdziwe miejsce ma d=2 przy w=1, a identyczna fraza dalej
+    // ("all the way up again") daje dopasowanie IDEALNE przy w=11. Gdyby
+    // przebieg tol=0 zastosować globalnie, emisja ruszyłaby od "again ok."
+    // — UBYTEK 8 słów, całe zdanie znika bezpowrotnie.
+    // Duplikat 2 słów jest TAŃSZY niż ubytek 8 — to jest cena, którą świadomie
+    // płacimy na ścieżce pełnolistowej.
+    #[test]
+    fn t20_pelna_lista_finalu_nadal_najwczesniejsze_okno() {
+        let mut tr = tracker();
+        assert!(tr.on_partial(1, "well I said all the way up, then").is_none());
+        let frag = tr
+            .on_partial(1, "well I said all the way up, then we")
+            .expect("fragment cięty na przecinku");
+        assert_eq!(frag.text, "well I said all the way up,");
+        tr.commit(&frag); // kotwica = [all, the, way, up]
+
+        let emit = tr.on_final(
+            1,
+            1,
+            2,
+            "i said all the way on up to here and then all the way up again ok.",
+        );
+        assert!(!emit.reanchored);
+        assert_eq!(emit.text, "on up to here and then all the way up again ok.");
+    }
+
+    // T21: REGRESJA Z AUDYTU (#43 "ventilation"). Whisper dokleił z przodu "a"
+    // (log: '#43 szew: zdjęto powtórzone "a" z nakładki'), indeksy przesunęły
+    // się o 1 i okno licznikowe ±k w on_final dopasowywało kotwicę o jedną
+    // pozycję za wcześnie (d=2 = tol), przez co ogon finalu zaczynał się od
+    // ostatniego JUŻ WYEMITOWANEGO słowa. PRZED poprawką: "delta, echo fox."
+    #[test]
+    fn t21_ogon_finalu_bez_duplikatu_po_szwie() {
+        let mut tr = committed_abcd(1);
+        let emit = tr.on_final(1, 1, 1, "zero alpha bravo charlie delta, echo fox.");
+        assert!(!emit.reanchored);
+        assert!(emit.had_commits);
+        assert_eq!(emit.text, "echo fox.");
+        assert_eq!(tr.reanchors, 0);
     }
 }
