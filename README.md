@@ -176,6 +176,38 @@ uruchamiaj bez pliku — obowiązują te same wartości domyślne). Tryb testowy
 toru audio bez API: `engine = "off"` w sekcji `[translate]` (lektor czyta
 oryginalny, nieprzetłumaczony tekst).
 
+## Opcje eksperymentalne (`--experimental-futures`)
+
+Funkcje jeszcze niedomyślne włącza się WYŁĄCZNIE flagą wiersza poleceń —
+nie mają kluczy w pliku konfiguracyjnym. Nazwy oddziela się **przecinkami**:
+
+```sh
+nacelle-translator --experimental-futures=speculative-stt
+nacelle-translator --experimental-futures=speculative-stt,kolejna-opcja   # kilka naraz
+nacelle-translator --experimental-futures speculative-stt                 # też działa
+```
+
+Powtórzenie flagi sumuje opcje; nieznana nazwa kończy program kodem 2 i
+wypisuje listę dostępnych opcji (ta sama lista jest w `--help`, a podkomenda
+`check` pokazuje, które opcje są aktywne dla podanych argumentów).
+
+Dostępne dziś:
+
+- **`speculative-stt`** — spekulacyjne STT (LocalAgreement-2): whisper jest
+  puszczany co `stt.cadence_ms` czasu audio na rosnącym, **otwartym**
+  segmencie, a stabilny prefiks dwóch zgodnych przebiegów idzie do
+  tłumaczenia, zanim VAD domknie segment. Daje wyraźnie niższe opóźnienie
+  pierwszych słów kosztem dodatkowych przebiegów whispera (przy CPU-only
+  potrafi tor przeciążyć — wtedy nie włączaj). Klucze `cadence_ms`,
+  `min_open_ms` i `min_fragment_chars` w sekcji `[stt]` **stroją** tę
+  funkcję, ale jej nie włączają; przy włączonej spekulacji opłaca się też
+  podnieść `vad.soft_max_ms` (patrz komentarz w
+  `nacelle-translator.toml.example`).
+
+Uruchomienie z opcją eksperymentalną wypisuje na starcie linię `INFO`
+`OPCJA EKSPERYMENTALNA: …` — po to, by log z sesji dało się jednoznacznie
+przypisać do wariantu.
+
 ## Wybór urządzenia wyjściowego
 
 Bez `output_device` w konfiguracji program **odczytuje** (nigdy nie zapisuje)
