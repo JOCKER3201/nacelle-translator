@@ -95,23 +95,30 @@ ollama_timeout_s = 60            # timeout dla silnika "ollama" (lokalny model b
 [tts]
 piper_bin = "~/.local/share/piper/piper/piper"
 voice = "~/.local/share/piper/pl_PL-gosia-medium.onnx"
-length_scale = 0.60             # <1.0 = szybsza mowa. 0.68 -> 0.60 na podstawie pomiaru
-                                 # z 7-minutowej sesji EN->PL: polskie wyjście ma ekspansję
-                                 # 1.21 w znakach, więc zmieszczenie się w materiale wymaga
-                                 # 19.75 zn/s, a piper przy 0.68 daje tylko 18.92 zn/s —
-                                 # obciążenie kanału lektora wynosiło 97.1 % i tryb
-                                 # doganiania był WARUNKIEM DZIAŁANIA, a nie rezerwą.
-                                 # Przy 0.60 obciążenie spada do ~95 %, a stan ustalony
-                                 # opóźnienia z ~6.6 s do ~3-4 s.
-                                 # 0.63 NIE jest wariantem awaryjnym: z tego samego modelu
-                                 # wychodzi ~99 % obciążenia, czyli powrót do nasycenia
-                                 # (0.68 -> 106 %, 0.63 -> 99 %, 0.60 -> 95 %, 0.55 -> 89 %).
-                                 # Jeśli 0.60 brzmi za szybko, skracaj tekst wyjściowy,
-                                 # a nie podnoś length_scale.
-                                 # ZASTRZEŻENIE: 18.92 / 21.80 zn/s zmierzono dla głosu
-                                 # pl_PL-*-medium i pary EN->PL. To NIE jest uniwersalna
-                                 # stała — dla innego głosu i innej pary językowej ekspansję
-                                 # i przepustowość trzeba przemierzyć od nowa.
+length_scale = 0.68             # <1.0 = szybsza mowa. Wartość dobrana ODSŁUCHEM —
+                                 # przy tempie lektora to kryterium bije rachunek.
+                                 # Próbowano 0.60 (wychodziło z bilansu czasu mowy):
+                                 # zmierzone 20.7 zn/s wobec 17.8 zn/s przy 0.68, czyli
+                                 # 16 % szybciej — odrzucone jako pośpieszne.
+                                 #
+                                 # ŚWIADOMY KOSZT przy materiale bez pauz (mowa ciągła):
+                                 # polskie wyjście ma ekspansję ~1.21 w znakach, więc
+                                 # zmieszczenie się w materiale wymagałoby ~19.75 zn/s.
+                                 # Przy 0.68 obciążenie kanału lektora sięga ~106 % i tryb
+                                 # doganiania staje się WARUNKIEM DZIAŁANIA (~51 % klipów),
+                                 # a nie rezerwą: opóźnienie ustala się na ~6.5 s i po końcu
+                                 # materiału zostaje ~10 s ogona. Przy materiale z pauzami
+                                 # kolejka nadrabia i nic z tego nie słychać.
+                                 #
+                                 # Model do przeliczeń: 0.68 -> ~106 %, 0.63 -> ~99 %,
+                                 # 0.60 -> ~95 %, 0.55 -> ~89 %. Obciążenia NIE zbija się
+                                 # już tempem — próg akceptowalności odsłuchu leży wyżej
+                                 # niż próg wydolności kanału. Właściwy kierunek to
+                                 # skrócenie tekstu wyjściowego, nie przyspieszanie lektora.
+                                 # ZASTRZEŻENIE: te zn/s zmierzono dla głosu pl_PL-*-medium
+                                 # i pary EN->PL. To NIE jest uniwersalna stała — dla innego
+                                 # głosu i innej pary językowej ekspansję i przepustowość
+                                 # trzeba przemierzyć od nowa.
                                  # NIEZMIENNIK: catchup_length_scale <= length_scale
                                  # (równe = doganianie wyłączone).
 catchup_length_scale = 0.55      # tempo doganiania: gdy zadanie ma >1 s zaległości
