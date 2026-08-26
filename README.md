@@ -176,15 +176,15 @@ uruchamiaj bez pliku — obowiązują te same wartości domyślne). Tryb testowy
 toru audio bez API: `engine = "off"` w sekcji `[translate]` (lektor czyta
 oryginalny, nieprzetłumaczony tekst).
 
-## Opcje eksperymentalne (`--experimental-futures`)
+## Opcje eksperymentalne (`--experimental-features`)
 
 Funkcje jeszcze niedomyślne włącza się WYŁĄCZNIE flagą wiersza poleceń —
 nie mają kluczy w pliku konfiguracyjnym. Nazwy oddziela się **przecinkami**:
 
 ```sh
-nacelle-translator --experimental-futures=speculative-stt
-nacelle-translator --experimental-futures=speculative-stt,kolejna-opcja   # kilka naraz
-nacelle-translator --experimental-futures speculative-stt                 # też działa
+nacelle-translator --experimental-features=speculative-stt
+nacelle-translator --experimental-features=speculative-stt,kolejna-opcja   # kilka naraz
+nacelle-translator --experimental-features speculative-stt                 # też działa
 ```
 
 Powtórzenie flagi sumuje opcje; nieznana nazwa kończy program kodem 2 i

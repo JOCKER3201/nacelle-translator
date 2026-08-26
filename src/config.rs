@@ -111,7 +111,7 @@ pub struct SttCfg {
     /// idzie do tłumaczenia od razu, final domyka tylko ogon.
     ///
     /// POLE WYŁĄCZNIE RUNTIME — celowo `skip`, czyli NIE do ustawienia z pliku
-    /// TOML: jedynym wejściem jest flaga `--experimental-futures=speculative-stt`
+    /// TOML: jedynym wejściem jest flaga `--experimental-features=speculative-stt`
     /// (patrz experimental.rs), którą main.rs nakłada na wczytaną konfigurację.
     /// Dzięki temu tor AI czyta dalej po prostu `stt_cfg.speculative` i nie musi
     /// wiedzieć, skąd ta wartość pochodzi.
@@ -251,7 +251,7 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 const RETIRED_KEYS: &[(&str, &str)] = &[(
     "speculative",
     "spekulacyjne STT jest teraz funkcją eksperymentalną i włącza je WYŁĄCZNIE \
-     flaga wiersza poleceń: nacelle-translator --experimental-futures=speculative-stt",
+     flaga wiersza poleceń: nacelle-translator --experimental-features=speculative-stt",
 )];
 
 /// Parsowanie z podmianą komunikatu dla wycofanych kluczy (osobno od `load`,
@@ -318,7 +318,7 @@ impl Config {
             return Some(format!(
                 "vad.soft_max_ms = {} bez spekulacyjnego STT: pierwsze słowa lektora czekają \
                  do {:.1} s od początku frazy — zejdź na 2000-3000 albo uruchom z flagą \
-                 --experimental-futures=speculative-stt (pod nią wyższa wartość jest zyskiem)",
+                 --experimental-features=speculative-stt (pod nią wyższa wartość jest zyskiem)",
                 self.vad.soft_max_ms,
                 self.vad.soft_max_ms as f32 / 1000.0
             ));
@@ -336,7 +336,7 @@ mod tests {
         let err = parse_str("[stt]\nspeculative = true\n", Path::new("nacelle-translator.toml"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("--experimental-futures=speculative-stt"), "{err}");
+        assert!(err.contains("--experimental-features=speculative-stt"), "{err}");
         assert!(err.contains("speculative"), "{err}");
         assert!(!err.contains("unknown field"), "surowy błąd serde nie może wyciec: {err}");
     }
@@ -353,7 +353,7 @@ mod tests {
         cfg.vad.soft_max_ms = 6_000;
         let w = cfg.tuning_warning().expect("6000 bez spekulacji to opóźnienie, nie strojenie");
         assert!(w.contains("6.0 s"), "{w}");
-        assert!(w.contains("--experimental-futures=speculative-stt"), "{w}");
+        assert!(w.contains("--experimental-features=speculative-stt"), "{w}");
         // ta sama wartość Z flagą jest zamierzona i musi milczeć
         cfg.stt.speculative = true;
         assert!(cfg.tuning_warning().is_none());

@@ -1,4 +1,4 @@
-//! Opcje eksperymentalne wiersza poleceń: `--experimental-futures=a,b,c`.
+//! Opcje eksperymentalne wiersza poleceń: `--experimental-features=a,b,c`.
 //!
 //! Flaga jest JEDYNYM wejściem do funkcji eksperymentalnych — celowo nie ma
 //! dla nich kluczy w pliku konfiguracyjnym. Inaczej „eksperymentalne" znaczy
@@ -17,16 +17,17 @@
 
 use crate::config::Config;
 
-/// Nazwa flagi w jednym miejscu — używana też w komunikatach błędów.
+/// Nazwa flagi w jednym miejscu — używana też w komunikatach błędów, w bloku
+/// `--help` i w podkomendzie `check`, żeby nie dało się jej zmienić w połowie.
 ///
-/// Pisownia `futures` (a nie `features`) jest CELOWA i nie jest literówką do
-/// poprawienia w dobrej wierze: nazwa flagi to publiczny interfejs programu,
-/// więc jej zmiana psuje każdy istniejący alias i skrypt.
-pub const FLAG: &str = "--experimental-futures";
+/// Nazwa jest publicznym interfejsem programu, więc jej zmiana po wydaniu psuje
+/// cudze skrypty i aliasy — ustalona przed pierwszą publikacją i od tej pory
+/// traktowana jak stała.
+pub const FLAG: &str = "--experimental-features";
 
 #[derive(Debug)]
 pub struct Feature {
-    /// nazwa podawana po przecinku w `--experimental-futures=`
+    /// nazwa podawana po przecinku w `--experimental-features=`
     pub name: &'static str,
     /// jedno zdanie do `--help` i do `check`
     pub help: &'static str,
