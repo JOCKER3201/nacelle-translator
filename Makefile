@@ -3,10 +3,14 @@
 #
 #   make build      ./build.sh (czysty build, cargo clean + release) — sam build
 #   make dist       pakuje binarkę + biblioteki CUDA runtime do dist/ — samo pakowanie
-#   make install    JEDNO polecenie: czysty build + pakowanie + instalacja do
-#                   /opt/nacelle-translator (bin/, lib/, models/, config). Usuwa
-#                   ./target przed budowaniem i zaraz po spakowaniu, więc zawsze
-#                   instaluje świeżo zbudowaną wersję, nigdy nieaktualne dist/.
+#   make install    kopiuje dist/ (musi już istnieć — patrz "make build" i
+#                   "make dist") do /opt/nacelle-translator (bin/, lib/,
+#                   models/, config). ./target NIE jest tu ruszane: czyszczenie
+#                   należy WYŁĄCZNIE do "make build" (cargo clean przed
+#                   budową, patrz build.sh) — i tak jest ignorowane przez git
+#                   (.gitignore), więc kasowanie go tutaj nie miało innego celu
+#                   niż "świeży build", a psuło cache kompilacji przy każdej
+#                   instalacji bez realnej potrzeby.
 #   make uninstall
 #   make clean
 #
@@ -27,10 +31,6 @@ dist:
 	./package.sh
 
 install:
-	rm -rf target
-	./build.sh --fast
-	./package.sh
-	rm -rf target
 	@test -f dist/bin/nacelle-translator || { \
 		echo "błąd: dist/bin/nacelle-translator nie powstał — sprawdź log budowania wyżej" >&2; \
 		exit 1; \
@@ -59,4 +59,3 @@ uninstall:
 
 clean:
 	cargo clean
-	rm -rf dist
