@@ -195,15 +195,23 @@ impl Segmenter {
     }
 
     /// Migawka OTWARTEGO segmentu dla spekulacyjnego STT: (generacja, kopia
-    /// całego bufora audio, ms rozpoznanej mowy). None gdy nic nie jest
-    /// otwarte. Kopia, nie pożyczka — wątek STT pracuje na niej, gdy bufor
-    /// dalej rośnie. Bramkę min_open_ms stosuje WYWOŁUJĄCY (tam mieszka
-    /// config STT); koszt klonu (maks. ~512 KB co kadencję) jest pomijalny.
-    pub fn open_snapshot(&self) -> Option<(u64, Vec<f32>, u32)> {
+    /// całego bufora audio, ms rozpoznanej mowy, czy to ogon po cięciu
+    /// wymuszonym). None gdy nic nie jest otwarte. Kopia, nie pożyczka —
+    /// wątek STT pracuje na niej, gdy bufor dalej rośnie. Bramkę min_open_ms
+    /// stosuje WYWOŁUJĄCY (tam mieszka config STT); koszt klonu (maks.
+    /// ~512 KB co kadencję) jest pomijalny.
+    ///
+    /// Czwarty element (`tail_of_forced_cut`) MUSI trafić do bramki
+    /// spekulacji tak samo jak trafia do bramki domknięcia niżej
+    /// (`speech_ms >= min_speech_ms || tail_of_forced_cut`) — bez niego
+    /// bufor bezpośrednio po cięciu wymuszonym (nakładka + ogon, realna
+    /// potwierdzona mowa) czeka na spekulację tak, jakby był świeżą,
+    /// niepotwierdzoną ciszą, bo `speech_ms` startuje wtedy od zera.
+    pub fn open_snapshot(&self) -> Option<(u64, Vec<f32>, u32, bool)> {
         if matches!(self.state, State::Idle) {
             return None;
         }
-        Some((self.gen, self.seg.clone(), self.speech_ms))
+        Some((self.gen, self.seg.clone(), self.speech_ms, self.tail_of_forced_cut))
     }
 
     /// Podaj kolejne okno 512 próbek wraz z prawdopodobieństwem mowy z VAD.
@@ -515,8 +523,9 @@ mod tests {
         assert_eq!(at, 9);
         assert!(u.forced);
         assert_eq!(u.gen, 1);
-        let (gen, audio, _) = s.open_snapshot().expect("mowa trwa dalej");
+        let (gen, audio, _, tail_of_forced_cut) = s.open_snapshot().expect("mowa trwa dalej");
         assert_eq!(gen, 2);
+        assert!(tail_of_forced_cut);
         // nowy bufor = nakładka 32 ms (ostatnie 512 próbek głowy, chunk nr 8)
         // + ogon (chunk nr 9)
         assert_eq!(audio.len(), 2 * VAD_CHUNK);
@@ -609,12 +618,14 @@ mod tests {
         assert!(s.open_snapshot().is_none());
         let c = chunk(0.0);
         assert!(s.push_chunk(&c, 0.9).is_none());
-        let (gen, a1, speech_ms) = s.open_snapshot().expect("segment otwarty");
+        let (gen, a1, speech_ms, tail_of_forced_cut) =
+            s.open_snapshot().expect("segment otwarty");
         assert_eq!(gen, 1);
         assert_eq!(a1.len(), VAD_CHUNK);
         assert_eq!(speech_ms, 32);
+        assert!(!tail_of_forced_cut);
         assert!(s.push_chunk(&c, 0.9).is_none());
-        let (_, a2, _) = s.open_snapshot().expect("segment nadal otwarty");
+        let (_, a2, _, _) = s.open_snapshot().expect("segment nadal otwarty");
         assert_eq!(a2.len(), 2 * VAD_CHUNK);
     }
 
@@ -633,7 +644,7 @@ mod tests {
         assert!(s.is_idle());
         // następny segment dostaje generację 2 — odrzucenie skonsumowało 1
         assert!(s.push_chunk(&c, 0.9).is_none());
-        let (gen, _, _) = s.open_snapshot().expect("segment otwarty");
+        let (gen, _, _, _) = s.open_snapshot().expect("segment otwarty");
         assert_eq!(gen, 2);
     }
 }

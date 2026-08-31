@@ -295,8 +295,16 @@ fn segmenter_thread(
                 cadence_acc += CHUNK_MS;
                 if cadence_acc >= stt_cfg.cadence_ms {
                     cadence_acc = 0;
-                    if let Some((gen, audio, speech_ms)) = segmenter.open_snapshot() {
-                        if should_speculate(audio.len(), speech_ms, stt_cfg.min_open_ms, min_speech_ms) {
+                    if let Some((gen, audio, speech_ms, tail_of_forced_cut)) =
+                        segmenter.open_snapshot()
+                    {
+                        if should_speculate(
+                            audio.len(),
+                            speech_ms,
+                            tail_of_forced_cut,
+                            stt_cfg.min_open_ms,
+                            min_speech_ms,
+                        ) {
                             let pjob = PartialJob {
                                 gen,
                                 created: Instant::now(),
@@ -889,8 +897,26 @@ enum Tempo {
 ///    dźwięku, które 10 s później VAD odrzucił jako za krótkie/niepewne).
 ///    Oba progi mierzą coś innego (surowa długość bufora vs. potwierdzona
 ///    mowa) i mogą się rozjechać — stąd wymóg obu naraz, nie tylko dłuższego.
-fn should_speculate(audio_len: usize, speech_ms: u32, min_open_ms: u32, min_speech_ms: u32) -> bool {
-    audio_len >= min_open_ms as usize * VAD_RATE / 1000 && speech_ms >= min_speech_ms
+///
+/// `tail_of_forced_cut` obchodzi WYŁĄCZNIE próg `min_speech_ms`, tak samo
+/// jak przy domknięciu w vad.rs (`speech_ms >= min_speech_ms ||
+/// tail_of_forced_cut`): tuż po cięciu wymuszonym (soft_max/hard_max)
+/// `speech_ms` nowego segmentu startuje od zera, mimo że jego bufor już
+/// niesie realną, potwierdzoną mowę sprzed cięcia (nakładka overlap_ms +
+/// ogon) — bez tego bypassu każde cięcie wymuszone (rutynowe w ciągłej,
+/// dłuższej wypowiedzi przy hard_max_ms rzędu kilku-kilkunastu sekund)
+/// wstrzymywałoby dopływ fragmentów na czas potrzebny do naliczenia
+/// min_speech_ms NOWEGO audio, mimo że bufor od razu po cięciu nie zawiera
+/// szumu ani ciszy, tylko mowę, która już raz przeszła przez VAD.
+fn should_speculate(
+    audio_len: usize,
+    speech_ms: u32,
+    tail_of_forced_cut: bool,
+    min_open_ms: u32,
+    min_speech_ms: u32,
+) -> bool {
+    audio_len >= min_open_ms as usize * VAD_RATE / 1000
+        && (speech_ms >= min_speech_ms || tail_of_forced_cut)
 }
 
 /// Wydzielone z tts_thread jako funkcja czysta — wybór tempa to jedyna decyzja
@@ -1275,14 +1301,14 @@ mod tests {
     #[test]
     fn g1_dlugi_ale_niepotwierdzony_bufor_nie_spekuluje() {
         let min_open_samples = 1_500 * VAD_RATE / 1000;
-        assert!(!should_speculate(min_open_samples, 0, 1_500, 500));
-        assert!(!should_speculate(min_open_samples * 2, 400, 1_500, 500));
+        assert!(!should_speculate(min_open_samples, 0, false, 1_500, 500));
+        assert!(!should_speculate(min_open_samples * 2, 400, false, 1_500, 500));
     }
 
     #[test]
     fn g2_oba_progi_spelnione_pozwalaja_spekulowac() {
         let min_open_samples = 1_500 * VAD_RATE / 1000;
-        assert!(should_speculate(min_open_samples, 500, 1_500, 500));
+        assert!(should_speculate(min_open_samples, 500, false, 1_500, 500));
     }
 
     #[test]
@@ -1291,7 +1317,18 @@ mod tests {
         // segmencie (teoretyczny przy niskim CHUNK_MS) — pierwszy warunek
         // dalej obowiązuje niezależnie od drugiego
         let too_short = 1_000 * VAD_RATE / 1000;
-        assert!(!should_speculate(too_short, 10_000, 1_500, 500));
+        assert!(!should_speculate(too_short, 10_000, false, 1_500, 500));
+    }
+
+    /// ogon cięcia wymuszonego: bufor spełnia min_open_ms, ale speech_ms
+    /// dopiero co wystartował od zera (jak zaraz po maybe_force_cut w
+    /// vad.rs) — bez bypassu spekulacja wstrzymałaby się mimo realnej,
+    /// potwierdzonej mowy przeniesionej w nakładce+ogonie
+    #[test]
+    fn g4_ogon_ciecia_wymuszonego_omija_prog_min_speech_ms() {
+        let min_open_samples = 1_500 * VAD_RATE / 1000;
+        assert!(!should_speculate(min_open_samples, 0, false, 1_500, 500));
+        assert!(should_speculate(min_open_samples, 0, true, 1_500, 500));
     }
 
     /// tempo nominalne: świeże zadanie, tłumaczenie mieszczące się w oryginale
