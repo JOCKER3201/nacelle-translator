@@ -625,11 +625,7 @@ fn stt_thread(
             // logu ŻADNEGO śladu poza samą treścią ogona, więc audyt musiał
             // ręcznie zestawiać fragmenty z finałem, żeby policzyć pokrycie
             if emit.had_commits {
-                log::info!(
-                    "#{} final częściowo pokryty fragmentami: ogon {:.0}% tekstu",
-                    job.id,
-                    emit.char_share * 100.0
-                );
+                log::info!("#{} {}", job.id, opisz_pokrycie_finalu(emit.char_share));
             }
             (emit.text, secs * emit.char_share, lang, emit.had_commits)
         } else {
@@ -922,6 +918,31 @@ fn should_speculate(
 /// Wydzielone z tts_thread jako funkcja czysta — wybór tempa to jedyna decyzja
 /// tego wątku zależna od danych, a tak daje się sprawdzić testem bez procesów
 /// pipera i bez wątków.
+/// Opis pokrycia finału fragmentami spekulacyjnymi, do logu. Wydzielone jako
+/// funkcja czysta (wzorem should_speculate/pick_tempo), żeby próg dało się
+/// przetestować bez budowania FinalEmit.
+///
+/// Próg 0.99 zamiast 1.0: reanchor-fallback w agreement.rs (`c.saturating_sub
+/// (ANCHOR_K)`) może dać `start` bliskie zeru mimo `committed > 0`, więc
+/// `char_share` (udział ogona w pełnym tekście finału) wychodzi bliskie 1.0
+/// — realne pokrycie przez fragmenty jest wtedy PRAKTYCZNIE ZEROWE, a słowo
+/// "częściowo" sugerowałoby coś przeciwnego. Ten sam segment i tak dostaje
+/// osobny WARN o re-kotwiczeniu (wyżej) — tu chodzi wyłącznie o to, żeby ta
+/// linia nie kłamała, czytana samodzielnie.
+fn opisz_pokrycie_finalu(char_share: f32) -> String {
+    if char_share >= 0.99 {
+        format!(
+            "final niemal w całości nowy — fragmenty pokryły tylko {:.0}% tekstu",
+            (1.0 - char_share) * 100.0
+        )
+    } else {
+        format!(
+            "final częściowo pokryty fragmentami: ogon {:.0}% tekstu",
+            char_share * 100.0
+        )
+    }
+}
+
 fn pick_tempo(age: Duration, chars: usize, orig_secs: f32) -> Tempo {
     let oversized = chars as f32 / orig_secs.max(0.5) > 30.0;
     if age > CATCHUP_AFTER || oversized {
@@ -1329,6 +1350,22 @@ mod tests {
         let min_open_samples = 1_500 * VAD_RATE / 1000;
         assert!(!should_speculate(min_open_samples, 0, false, 1_500, 500));
         assert!(should_speculate(min_open_samples, 0, true, 1_500, 500));
+    }
+
+    #[test]
+    fn g5_pokrycie_czesciowe_normalne() {
+        let opis = opisz_pokrycie_finalu(0.5);
+        assert!(opis.contains("częściowo"), "{opis}");
+        assert!(opis.contains("50%"), "{opis}");
+    }
+
+    /// reanchor-fallback może dać char_share bliskie 1.0 mimo committed>0 —
+    /// "częściowo pokryty" byłoby tu kłamstwem, bo fragmenty pokryły ~0%
+    #[test]
+    fn g6_pokrycie_prawie_zerowe_nie_nazywa_sie_czesciowym() {
+        let opis = opisz_pokrycie_finalu(0.995);
+        assert!(!opis.contains("częściowo"), "{opis}");
+        assert!(opis.contains("0%"), "{opis}");
     }
 
     /// tempo nominalne: świeże zadanie, tłumaczenie mieszczące się w oryginale
