@@ -612,6 +612,17 @@ fn stt_thread(
                 (true, Some(l)) => l,
                 _ => t.lang.clone(),
             };
+            // siostrzana linia do "final w całości pokryty fragmentami" —
+            // bez niej częściowe pokrycie (najczęstszy przypadek) nie ma w
+            // logu ŻADNEGO śladu poza samą treścią ogona, więc audyt musiał
+            // ręcznie zestawiać fragmenty z finałem, żeby policzyć pokrycie
+            if emit.had_commits {
+                log::info!(
+                    "#{} final częściowo pokryty fragmentami: ogon {:.0}% tekstu",
+                    job.id,
+                    emit.char_share * 100.0
+                );
+            }
             (emit.text, secs * emit.char_share, lang, emit.had_commits)
         } else {
             (t.text, secs, t.lang.clone(), false)
