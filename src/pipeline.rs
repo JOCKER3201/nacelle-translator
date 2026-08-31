@@ -219,6 +219,16 @@ fn segmenter_thread(
             return;
         }
     };
+    // zapamiętane PRZED przeniesieniem vad_cfg do Segmentera: bramka
+    // spekulacji musi wymagać tego samego progu potwierdzonej mowy, którym
+    // VAD sam rządzi się przy akceptacji domkniętego segmentu — inaczej te
+    // dwa progi mierzą różne rzeczy (surowa długość bufora vs. potwierdzona
+    // mowa) i mogą się rozjechać: krótki, niejednoznaczny fragment audio
+    // może przekroczyć min_open_ms, zanim VAD w ogóle uzna go za mowę, a
+    // wtedy spekulacja transkrybuje i wypowiada coś, co segmenter later
+    // odrzuci po cichu jako szum — czyli wygłoszoną treść, której mówca
+    // nigdy nie powiedział (obserwowane w logu 2026-08-28, gen 838).
+    let min_speech_ms = vad_cfg.min_speech_ms;
     let mut segmenter = Segmenter::new(vad_cfg);
     let mut pcm16k: Vec<f32> = Vec::with_capacity(4 * VAD_RATE);
     let mut chunk = vec![0.0f32; VAD_CHUNK];
@@ -285,11 +295,16 @@ fn segmenter_thread(
                 cadence_acc += CHUNK_MS;
                 if cadence_acc >= stt_cfg.cadence_ms {
                     cadence_acc = 0;
-                    if let Some((gen, audio, speech_ms)) = segmenter.open_snapshot() {
-                        // pad zerowy whispera (MIN_SAMPLES) daje na krótkim
-                        // buforze skorelowane halucynacje — poniżej
-                        // min_open_ms nie spekulujemy
-                        if audio.len() >= stt_cfg.min_open_ms as usize * VAD_RATE / 1000 {
+                    if let Some((gen, audio, speech_ms, tail_of_forced_cut)) =
+                        segmenter.open_snapshot()
+                    {
+                        if should_speculate(
+                            audio.len(),
+                            speech_ms,
+                            tail_of_forced_cut,
+                            stt_cfg.min_open_ms,
+                            min_speech_ms,
+                        ) {
                             let pjob = PartialJob {
                                 gen,
                                 created: Instant::now(),
@@ -605,6 +620,13 @@ fn stt_thread(
                 (true, Some(l)) => l,
                 _ => t.lang.clone(),
             };
+            // siostrzana linia do "final w całości pokryty fragmentami" —
+            // bez niej częściowe pokrycie (najczęstszy przypadek) nie ma w
+            // logu ŻADNEGO śladu poza samą treścią ogona, więc audyt musiał
+            // ręcznie zestawiać fragmenty z finałem, żeby policzyć pokrycie
+            if emit.had_commits {
+                log::info!("#{} {}", job.id, opisz_pokrycie_finalu(emit.char_share));
+            }
             (emit.text, secs * emit.char_share, lang, emit.had_commits)
         } else {
             (t.text, secs, t.lang.clone(), false)
@@ -854,9 +876,73 @@ enum Tempo {
     Doganianie,
 }
 
+/// Czy otwarty (jeszcze niedomknięty) segment kwalifikuje się do przebiegu
+/// spekulacyjnego. Wydzielone z segmenter_thread — dwa NIEZALEŻNE progi, oba
+/// muszące być spełnione naraz:
+///  - `audio_len >= min_open_ms`: pad zerowy whispera (MIN_SAMPLES) na
+///    krótkim buforze daje skorelowane halucynacje, które LocalAgreement
+///    błędnie uznałby za "stabilne", bo obie próby powtórzą ten sam błąd;
+///  - `speech_ms >= min_speech_ms`: TEN SAM próg, którym VAD rządzi się przy
+///    akceptacji domkniętego segmentu (vad.rs) — bufor może być długi (cisza
+///    + preroll + urywki o niskim p), a mimo to VAD nie uznał jeszcze ŻADNEJ
+///    jego części za potwierdzoną mowę. Bez tego warunku spekulacja mogła
+///    transkrybować i wypowiedzieć treść z fragmentu, który segmenter later
+///    i tak odrzuci po cichu jako szum — czyli wygłosić zdanie, którego
+///    mówca nigdy nie powiedział (obserwowane w logu produkcyjnym: whisper
+///    "usłyszał" i lektor przeczytał pełne zdanie z 2,4 s niejednoznacznego
+///    dźwięku, które 10 s później VAD odrzucił jako za krótkie/niepewne).
+///    Oba progi mierzą coś innego (surowa długość bufora vs. potwierdzona
+///    mowa) i mogą się rozjechać — stąd wymóg obu naraz, nie tylko dłuższego.
+///
+/// `tail_of_forced_cut` obchodzi WYŁĄCZNIE próg `min_speech_ms`, tak samo
+/// jak przy domknięciu w vad.rs (`speech_ms >= min_speech_ms ||
+/// tail_of_forced_cut`): tuż po cięciu wymuszonym (soft_max/hard_max)
+/// `speech_ms` nowego segmentu startuje od zera, mimo że jego bufor już
+/// niesie realną, potwierdzoną mowę sprzed cięcia (nakładka overlap_ms +
+/// ogon) — bez tego bypassu każde cięcie wymuszone (rutynowe w ciągłej,
+/// dłuższej wypowiedzi przy hard_max_ms rzędu kilku-kilkunastu sekund)
+/// wstrzymywałoby dopływ fragmentów na czas potrzebny do naliczenia
+/// min_speech_ms NOWEGO audio, mimo że bufor od razu po cięciu nie zawiera
+/// szumu ani ciszy, tylko mowę, która już raz przeszła przez VAD.
+fn should_speculate(
+    audio_len: usize,
+    speech_ms: u32,
+    tail_of_forced_cut: bool,
+    min_open_ms: u32,
+    min_speech_ms: u32,
+) -> bool {
+    audio_len >= min_open_ms as usize * VAD_RATE / 1000
+        && (speech_ms >= min_speech_ms || tail_of_forced_cut)
+}
+
 /// Wydzielone z tts_thread jako funkcja czysta — wybór tempa to jedyna decyzja
 /// tego wątku zależna od danych, a tak daje się sprawdzić testem bez procesów
 /// pipera i bez wątków.
+/// Opis pokrycia finału fragmentami spekulacyjnymi, do logu. Wydzielone jako
+/// funkcja czysta (wzorem should_speculate/pick_tempo), żeby próg dało się
+/// przetestować bez budowania FinalEmit.
+///
+/// Próg 0.99 zamiast 1.0: reanchor-fallback w agreement.rs (`c.saturating_sub
+/// (ANCHOR_K)`) może dać `start` bliskie zeru mimo `committed > 0`, więc
+/// `char_share` (udział ogona w pełnym tekście finału) wychodzi bliskie 1.0
+/// — realne pokrycie przez fragmenty jest wtedy PRAKTYCZNIE ZEROWE, a słowo
+/// "częściowo" sugerowałoby coś przeciwnego. Ten sam segment i tak dostaje
+/// osobny WARN o re-kotwiczeniu (wyżej) — tu chodzi wyłącznie o to, żeby ta
+/// linia nie kłamała, czytana samodzielnie.
+fn opisz_pokrycie_finalu(char_share: f32) -> String {
+    if char_share >= 0.99 {
+        format!(
+            "final niemal w całości nowy — fragmenty pokryły tylko {:.0}% tekstu",
+            (1.0 - char_share) * 100.0
+        )
+    } else {
+        format!(
+            "final częściowo pokryty fragmentami: ogon {:.0}% tekstu",
+            char_share * 100.0
+        )
+    }
+}
+
 fn pick_tempo(age: Duration, chars: usize, orig_secs: f32) -> Tempo {
     let oversized = chars as f32 / orig_secs.max(0.5) > 30.0;
     if age > CATCHUP_AFTER || oversized {
@@ -1228,6 +1314,58 @@ mod tests {
         assert!(!playback_resumed(cap / 2, cap)); // połowa to jeszcze nie
         assert!(playback_resumed(cap * 3 / 4, cap)); // dokładnie próg
         assert!(playback_resumed(cap, cap)); // pusty
+    }
+
+    /// odtwarza incydent gen 838 (log 2026-08-28): bufor przekroczył
+    /// min_open_ms samą długością, ale VAD nie potwierdził jeszcze ani
+    /// jednego chunka mowy — dawniej to wystarczało do spekulacji, dziś nie.
+    #[test]
+    fn g1_dlugi_ale_niepotwierdzony_bufor_nie_spekuluje() {
+        let min_open_samples = 1_500 * VAD_RATE / 1000;
+        assert!(!should_speculate(min_open_samples, 0, false, 1_500, 500));
+        assert!(!should_speculate(min_open_samples * 2, 400, false, 1_500, 500));
+    }
+
+    #[test]
+    fn g2_oba_progi_spelnione_pozwalaja_spekulowac() {
+        let min_open_samples = 1_500 * VAD_RATE / 1000;
+        assert!(should_speculate(min_open_samples, 500, false, 1_500, 500));
+    }
+
+    #[test]
+    fn g3_potwierdzona_mowa_ale_za_krotki_bufor_nie_spekuluje() {
+        // odwrotny przypadek: dużo potwierdzonej mowy w bardzo świeżym
+        // segmencie (teoretyczny przy niskim CHUNK_MS) — pierwszy warunek
+        // dalej obowiązuje niezależnie od drugiego
+        let too_short = 1_000 * VAD_RATE / 1000;
+        assert!(!should_speculate(too_short, 10_000, false, 1_500, 500));
+    }
+
+    /// ogon cięcia wymuszonego: bufor spełnia min_open_ms, ale speech_ms
+    /// dopiero co wystartował od zera (jak zaraz po maybe_force_cut w
+    /// vad.rs) — bez bypassu spekulacja wstrzymałaby się mimo realnej,
+    /// potwierdzonej mowy przeniesionej w nakładce+ogonie
+    #[test]
+    fn g4_ogon_ciecia_wymuszonego_omija_prog_min_speech_ms() {
+        let min_open_samples = 1_500 * VAD_RATE / 1000;
+        assert!(!should_speculate(min_open_samples, 0, false, 1_500, 500));
+        assert!(should_speculate(min_open_samples, 0, true, 1_500, 500));
+    }
+
+    #[test]
+    fn g5_pokrycie_czesciowe_normalne() {
+        let opis = opisz_pokrycie_finalu(0.5);
+        assert!(opis.contains("częściowo"), "{opis}");
+        assert!(opis.contains("50%"), "{opis}");
+    }
+
+    /// reanchor-fallback może dać char_share bliskie 1.0 mimo committed>0 —
+    /// "częściowo pokryty" byłoby tu kłamstwem, bo fragmenty pokryły ~0%
+    #[test]
+    fn g6_pokrycie_prawie_zerowe_nie_nazywa_sie_czesciowym() {
+        let opis = opisz_pokrycie_finalu(0.995);
+        assert!(!opis.contains("częściowo"), "{opis}");
+        assert!(opis.contains("0%"), "{opis}");
     }
 
     /// tempo nominalne: świeże zadanie, tłumaczenie mieszczące się w oryginale
