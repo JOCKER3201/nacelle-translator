@@ -5,6 +5,7 @@
 use crate::config::TtsCfg;
 use anyhow::{bail, Context, Result};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -32,24 +33,52 @@ impl PiperTts {
             }
         }
 
-        let mut child = Command::new(piper_bin)
-            .args([
-                "--model",
-                voice.to_str().context("ścieżka głosu nie jest UTF-8")?,
-                // --config zbędne: piper bierze <model>.json
-                // --espeak_data zbędne: binarka ma RUNPATH=$ORIGIN i znajduje dane obok siebie
-                "--json-input",
-                "--output_dir",
-                &cfg.work_dir,
-                "--length_scale",
-                &cfg.length_scale.to_string(),
-                "--sentence_silence",
-                &cfg.sentence_silence.to_string(),
-                "--quiet",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+        let mut cmd = Command::new(piper_bin);
+        cmd.args([
+            "--model",
+            voice.to_str().context("ścieżka głosu nie jest UTF-8")?,
+            // --config zbędne: piper bierze <model>.json
+            // --espeak_data zbędne: binarka ma RUNPATH=$ORIGIN i znajduje dane obok siebie
+            "--json-input",
+            "--output_dir",
+            &cfg.work_dir,
+            "--length_scale",
+            &cfg.length_scale.to_string(),
+            "--sentence_silence",
+            &cfg.sentence_silence.to_string(),
+            "--quiet",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+        // `main::block_shutdown_signals_before_spawning_threads` blokuje
+        // SIGINT/SIGTERM na wątku głównym PRZED tym `spawn()` (żeby wątki
+        // toru AI dziedziczyły już zablokowaną maskę — main.rs). fork+exec
+        // dziedziczy i ZACHOWUJE maskę sygnałów wołającego wątku (execve nie
+        // resetuje maski, tylko dyspozycję sygnałów z handlerem — `man 7
+        // signal`), więc bez tego kroku piper startowałby z trwale
+        // zablokowanymi SIGINT/SIGTERM i przestałby reagować na `kill`
+        // wysłany wprost do jego PID-u albo na Ctrl+C rozgłoszone do grupy
+        // procesów (piper dziedziczy pgid rodzica). Odblokowujemy więc oba
+        // sygnały W DZIECKU, tuż przed `exec` — działa to niezależnie od
+        // maski rodzica, bo `pre_exec` uruchamia się już po `fork`, na
+        // wątku, który zaraz i tak zniknie pod `execve`.
+        //
+        // SAFETY (`pre_exec` samo jest `unsafe fn` — dziecko po `fork`,
+        // przed `exec`): closure woła wyłącznie `sigemptyset`/`sigaddset`/
+        // `pthread_sigmask` na lokalnym, stosowym `sigset_t` — nic poza
+        // async-signal-safe, zgodnie z wymogiem `pre_exec`.
+        unsafe {
+            cmd.pre_exec(|| {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGINT);
+                libc::sigaddset(&mut set, libc::SIGTERM);
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+                Ok(())
+            });
+        }
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("nie mogę uruchomić pipera: {}", piper_bin.display()))?;
 
