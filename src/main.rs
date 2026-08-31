@@ -46,8 +46,8 @@ fn die_usage(msg: &str) -> ! {
     std::process::exit(2);
 }
 
-/// Blokuje SIGINT/SIGTERM na wątku głównym, ZANIM cokolwiek — w tym
-/// `pipeline::spawn` w `cmd_run` — zdąży stworzyć choć jeden wątek.
+/// Blokuje SIGINT/SIGTERM na wątku głównym, ZANIM `cmd_run` zdąży stworzyć
+/// choć jeden wątek albo odpalić choć jeden proces potomny.
 ///
 /// Wątek dziedziczy maskę sygnałów wątku, który go tworzy, w CHWILI
 /// tworzenia — maska jest per-wątek, nie per-proces. `pw::run_graph`
@@ -68,15 +68,40 @@ fn die_usage(msg: &str) -> ! {
 /// Redundancja z tym, co `add_signal_local` i tak robi wewnętrznie na wątku
 /// głównym, jest nieszkodliwa (blokowanie już zablokowanego sygnału to no-op).
 ///
+/// CELOWO wołane tylko z `cmd_run`, NIE bezwarunkowo na starcie `main()`:
+/// `cmd_devices`/`cmd_check` nigdy nie wołają `add_signal_local` (jedyne
+/// miejsce w repo, które z powrotem "konsumuje" te sygnały) i mogą wisieć
+/// bez końca w `pw::discover_sinks` (`enumerate_sinks`/`read_default_sink_name`
+/// robią `mainloop.run()` bez timeoutu — patrz komentarz przy
+/// `enumerate_sinks` w pw.rs o zawieszeniu "na zawsze" po zerwaniu socketu).
+/// Gdyby blokada obowiązywała i tam, zawieszony `devices`/`check` przestałby
+/// dało się przerwać przez Ctrl+C/`kill -TERM` — trzeba by SIGKILL. Te
+/// podkomendy nie tworzą żadnego wątku, więc nie potrzebują tej blokady:
+/// bez niej sygnał wysłany w trakcie ich działania trafia w domyślną
+/// dyspozycję na wątku głównym, dokładnie jak przed tym commitem.
+///
 /// Sygnał wysłany w oknie między tą funkcją a rejestracją w `run_graph` NIE
 /// ginie — zablokowany sygnał staje się PENDING dla procesu i zostanie
-/// odebrany, gdy tylko `add_signal_local` zacznie go nasłuchiwać.
+/// odebrany, gdy tylko `add_signal_local` zacznie go nasłuchiwać. To okno
+/// obejmuje `pipeline::spawn`: ładowanie modelu whisper do VRAM, budowę
+/// tłumacza (dla `ollama`/`llamacpp` to `*_check` z timeoutem do 5 s) i dwa
+/// `PiperTts::spawn` — w praktyce realnie kilka–kilkanaście sekund, w czasie
+/// których Ctrl+C/`kill -TERM` NIE przerywa startu natychmiast (co przed tym
+/// commitem działało, bo sygnał trafiał w domyślną dyspozycję) — trzeba
+/// poczekać, aż `run_graph` dojdzie do `add_signal_local`, albo użyć SIGKILL.
+/// Świadomy kompromis: brak tej blokady przywraca wyścig z wątkami toru AI,
+/// który jest tematem tego commita.
 ///
-/// Procesów potomnych (piper, uruchamiany przez `Command::spawn`) to nie
-/// dotyczy w praktyce: piper kończy się sam po EOF na stdin, gdy proces
-/// nadrzędny umiera, a jego jawne sprzątanie w `PiperTts::drop` idzie przez
-/// `Child::kill()` (SIGKILL) — niemaskowalny, działa niezależnie od maski
-/// sygnałów dziedziczonej przez fork+exec.
+/// Procesów potomnych (piper, uruchamiany przez `Command::spawn`) maska NIE
+/// jest obojętna: fork+exec dziedziczy i zachowuje maskę sygnałów wątku
+/// wołającego (`man 7 signal`), więc bez dodatkowego kroku piper startowałby
+/// z trwale zablokowanymi SIGINT/SIGTERM i przestałby reagować na `kill`
+/// wysłany wprost do jego PID-u albo na Ctrl+C rozgłoszone do grupy procesów
+/// (piper dziedziczy pgid rodzica — nigdzie nie wołamy `setsid`/
+/// `process_group`). Dlatego `PiperTts::spawn` (tts.rs) jawnie odblokowuje
+/// oba sygnały w dziecku tuż przed `exec` (`pre_exec`) — sprzątanie procesu
+/// nadrzędnego (`Child::kill()`/EOF na stdin) działa niezależnie i tak,
+/// odblokowanie dotyczy wyłącznie sygnału wysłanego BEZPOŚREDNIO do pipera.
 fn block_shutdown_signals_before_spawning_threads() {
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
@@ -88,7 +113,6 @@ fn block_shutdown_signals_before_spawning_threads() {
 }
 
 fn main() {
-    block_shutdown_signals_before_spawning_threads();
     let mut cmd = String::from("run");
     let mut config_path = PathBuf::from("nacelle-translator.toml");
     let mut verbose = false;
@@ -146,6 +170,9 @@ fn main() {
 }
 
 fn cmd_run(config_path: &PathBuf, experimental: &experimental::Selection) -> Result<()> {
+    // Musi być PIERWSZĄ rzeczą w tej funkcji, przed jakimkolwiek wątkiem czy
+    // procesem potomnym toru AI — patrz komentarz przy definicji funkcji.
+    block_shutdown_signals_before_spawning_threads();
     let mut cfg = Config::load(config_path)?;
     // opcje eksperymentalne nakładamy na WCZYTANĄ konfigurację — dalej cały
     // tor AI widzi zwykły Config i nie zna pojęcia flagi
