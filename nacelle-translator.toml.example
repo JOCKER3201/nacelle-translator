@@ -125,8 +125,13 @@ llamacpp_host = "http://localhost:8080" # adres llama-server (uruchamiany z --no
 target_language = "polski"       # nazwa języka używana w prompcie
 target_lang_code = "pl"          # kod porównywany z detekcją whispera
 skip_target_lang = true          # nie tłumacz tego, co już jest po polsku
-context_pairs = 3                # ile par (oryginał → tłumaczenie) w kontekście
+context_pairs = 10                # ile par (oryginał → tłumaczenie) w kontekście
                                   # (dla "gemini" też próg resetu łańcucha previous_interaction_id)
+                                  # zmierzone na "llamacpp": model ma n_ctx_slot=131072, przy 10
+                                  # parach realne zużycie to ~1000 tokenów, cache_prompt trzyma
+                                  # f_keep=1.000, latencja MT bez zmian. "claude"/"ollama" doklejają
+                                  # pełną historię do KAŻDEGO zapytania bez cache'a — dla "claude"
+                                  # (płatne API) to wprost więcej rozliczanych tokenów per zapytanie.
 max_tokens = 2048                # limit odpowiedzi (Claude: max_tokens, Ollama: num_predict, Gemini: max_output_tokens)
 timeout_s = 15                   # timeout dla silników "claude" i "gemini" (szybkie API)
 ollama_timeout_s = 60            # timeout dla silnika "ollama" (lokalny model bywa wolniejszy)

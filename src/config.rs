@@ -201,6 +201,21 @@ pub struct MtCfg {
     /// ile poprzednich par (oryginał → tłumaczenie) trzymać w kontekście
     /// (dla "gemini" to też próg, po którym łańcuch previous_interaction_id
     /// jest resetowany, żeby kontekst nie rósł bez końca)
+    ///
+    /// 3 -> 10 (2026-08-31), zmierzone na silniku "llamacpp": model serwowany
+    /// z n_ctx_slot=131072, realne zużycie przy 10 parach ~1000 tokenów
+    /// (promille dostępnego okna), cache_prompt trzyma f_keep=1.000 poza
+    /// pierwszą turą po resecie, mediana czasu MT bez zmian (40 ms). Dłuższy
+    /// kontekst ma bezpośrednio adresować gubienie ustaleń między zdaniami
+    /// (np. "degrees" jako kąt vs temperatura, kiedy rozstrzygający kontekst
+    /// wypadł już poza okno historii).
+    /// UWAGA: to zmierzone dla "llamacpp" (lokalny, cache_prompt). "claude"
+    /// i "ollama" doklejają PEŁNĄ historię do każdego zapytania bez cache'a —
+    /// dla "claude" (płatne API) większe context_pairs wprost zwiększa liczbę
+    /// rozliczanych tokenów per zapytanie. "gemini" (domyślny silnik) trzyma
+    /// kontekst po stronie serwera przez previous_interaction_id — tu
+    /// context_pairs odsuwa moment resetu łańcucha, nie mnoży wysyłanych
+    /// tokenów tak bezpośrednio jak w "claude"/"ollama"/"llamacpp".
     pub context_pairs: usize,
     /// limit długości odpowiedzi (Claude: max_tokens; Ollama: num_predict;
     /// Gemini: max_output_tokens)
@@ -224,7 +239,7 @@ impl Default for MtCfg {
             target_language: "polski".into(),
             target_lang_code: "pl".into(),
             skip_target_lang: true,
-            context_pairs: 3,
+            context_pairs: 10,
             max_tokens: 2048,
             timeout_s: 15,
             ollama_timeout_s: 60,
