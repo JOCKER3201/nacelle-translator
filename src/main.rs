@@ -46,7 +46,49 @@ fn die_usage(msg: &str) -> ! {
     std::process::exit(2);
 }
 
+/// Blokuje SIGINT/SIGTERM na wątku głównym, ZANIM cokolwiek — w tym
+/// `pipeline::spawn` w `cmd_run` — zdąży stworzyć choć jeden wątek.
+///
+/// Wątek dziedziczy maskę sygnałów wątku, który go tworzy, w CHWILI
+/// tworzenia — maska jest per-wątek, nie per-proces. `pw::run_graph`
+/// rejestruje własną obsługę tych sygnałów (`add_signal_local`), ale robi to
+/// PÓŹNO: dopiero w środku, długo po tym jak `pipeline::spawn` uruchomił
+/// wątki toru AI (STT, MT, TTS, segmenter, watchdog). Te wątki dziedziczyły
+/// więc maskę sprzed jakiejkolwiek blokady — sygnał wysłany do procesu
+/// (`kill`, Ctrl+C) mógł trafić w kernelu w DOWOLNY z nich, a żaden nie ma
+/// własnego handlera, więc zabijał cały proces przez domyślną dyspozycję:
+/// zero logu, zero sprzątania, ścieżka `pw::run_graph`'s `Ok(())` nigdy nie
+/// uruchomiona. Zweryfikowane empirycznie: `kill -TERM`/`kill -INT` na PID
+/// żywego procesu kończyły go natychmiast, bez śladu w logu.
+///
+/// Blokada tu, zanim jakikolwiek wątek istnieje, sprawia że KAŻDY później
+/// tworzony wątek (co najmniej `std::thread::spawn`, który na Linuksie idzie
+/// przez `pthread_create`) dziedziczy już zablokowaną maskę — jedynym
+/// miejscem, które w ogóle może odebrać sygnał, zostaje mechanizm PipeWire.
+/// Redundancja z tym, co `add_signal_local` i tak robi wewnętrznie na wątku
+/// głównym, jest nieszkodliwa (blokowanie już zablokowanego sygnału to no-op).
+///
+/// Sygnał wysłany w oknie między tą funkcją a rejestracją w `run_graph` NIE
+/// ginie — zablokowany sygnał staje się PENDING dla procesu i zostanie
+/// odebrany, gdy tylko `add_signal_local` zacznie go nasłuchiwać.
+///
+/// Procesów potomnych (piper, uruchamiany przez `Command::spawn`) to nie
+/// dotyczy w praktyce: piper kończy się sam po EOF na stdin, gdy proces
+/// nadrzędny umiera, a jego jawne sprzątanie w `PiperTts::drop` idzie przez
+/// `Child::kill()` (SIGKILL) — niemaskowalny, działa niezależnie od maski
+/// sygnałów dziedziczonej przez fork+exec.
+fn block_shutdown_signals_before_spawning_threads() {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
 fn main() {
+    block_shutdown_signals_before_spawning_threads();
     let mut cmd = String::from("run");
     let mut config_path = PathBuf::from("nacelle-translator.toml");
     let mut verbose = false;
