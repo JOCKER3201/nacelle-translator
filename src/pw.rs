@@ -1604,6 +1604,11 @@ pub fn run_graph(
     if let Some(msg) = fatal_msg {
         bail!(msg);
     }
+    // Bez tego KAŻDA z dotychczasowych sesji w logu urywa się w środku
+    // przetwarzania, bez śladu, czy to był zamierzony stop (Ctrl+C/SIGTERM),
+    // czy proces po prostu ktoś zabił z zewnątrz w trakcie pracy — audytu
+    // logu nie da się wtedy odróżnić od awarii bez zgadywania z kontekstu.
+    log::info!("zamknięcie: sygnał (Ctrl+C/SIGTERM), tor zatrzymany czysto");
     Ok(())
 }
 
