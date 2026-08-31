@@ -219,6 +219,16 @@ fn segmenter_thread(
             return;
         }
     };
+    // zapamiętane PRZED przeniesieniem vad_cfg do Segmentera: bramka
+    // spekulacji musi wymagać tego samego progu potwierdzonej mowy, którym
+    // VAD sam rządzi się przy akceptacji domkniętego segmentu — inaczej te
+    // dwa progi mierzą różne rzeczy (surowa długość bufora vs. potwierdzona
+    // mowa) i mogą się rozjechać: krótki, niejednoznaczny fragment audio
+    // może przekroczyć min_open_ms, zanim VAD w ogóle uzna go za mowę, a
+    // wtedy spekulacja transkrybuje i wypowiada coś, co segmenter later
+    // odrzuci po cichu jako szum — czyli wygłoszoną treść, której mówca
+    // nigdy nie powiedział (obserwowane w logu 2026-08-28, gen 838).
+    let min_speech_ms = vad_cfg.min_speech_ms;
     let mut segmenter = Segmenter::new(vad_cfg);
     let mut pcm16k: Vec<f32> = Vec::with_capacity(4 * VAD_RATE);
     let mut chunk = vec![0.0f32; VAD_CHUNK];
@@ -286,10 +296,7 @@ fn segmenter_thread(
                 if cadence_acc >= stt_cfg.cadence_ms {
                     cadence_acc = 0;
                     if let Some((gen, audio, speech_ms)) = segmenter.open_snapshot() {
-                        // pad zerowy whispera (MIN_SAMPLES) daje na krótkim
-                        // buforze skorelowane halucynacje — poniżej
-                        // min_open_ms nie spekulujemy
-                        if audio.len() >= stt_cfg.min_open_ms as usize * VAD_RATE / 1000 {
+                        if should_speculate(audio.len(), speech_ms, stt_cfg.min_open_ms, min_speech_ms) {
                             let pjob = PartialJob {
                                 gen,
                                 created: Instant::now(),
@@ -854,6 +861,27 @@ enum Tempo {
     Doganianie,
 }
 
+/// Czy otwarty (jeszcze niedomknięty) segment kwalifikuje się do przebiegu
+/// spekulacyjnego. Wydzielone z segmenter_thread — dwa NIEZALEŻNE progi, oba
+/// muszące być spełnione naraz:
+///  - `audio_len >= min_open_ms`: pad zerowy whispera (MIN_SAMPLES) na
+///    krótkim buforze daje skorelowane halucynacje, które LocalAgreement
+///    błędnie uznałby za "stabilne", bo obie próby powtórzą ten sam błąd;
+///  - `speech_ms >= min_speech_ms`: TEN SAM próg, którym VAD rządzi się przy
+///    akceptacji domkniętego segmentu (vad.rs) — bufor może być długi (cisza
+///    + preroll + urywki o niskim p), a mimo to VAD nie uznał jeszcze ŻADNEJ
+///    jego części za potwierdzoną mowę. Bez tego warunku spekulacja mogła
+///    transkrybować i wypowiedzieć treść z fragmentu, który segmenter later
+///    i tak odrzuci po cichu jako szum — czyli wygłosić zdanie, którego
+///    mówca nigdy nie powiedział (obserwowane w logu produkcyjnym: whisper
+///    "usłyszał" i lektor przeczytał pełne zdanie z 2,4 s niejednoznacznego
+///    dźwięku, które 10 s później VAD odrzucił jako za krótkie/niepewne).
+///    Oba progi mierzą coś innego (surowa długość bufora vs. potwierdzona
+///    mowa) i mogą się rozjechać — stąd wymóg obu naraz, nie tylko dłuższego.
+fn should_speculate(audio_len: usize, speech_ms: u32, min_open_ms: u32, min_speech_ms: u32) -> bool {
+    audio_len >= min_open_ms as usize * VAD_RATE / 1000 && speech_ms >= min_speech_ms
+}
+
 /// Wydzielone z tts_thread jako funkcja czysta — wybór tempa to jedyna decyzja
 /// tego wątku zależna od danych, a tak daje się sprawdzić testem bez procesów
 /// pipera i bez wątków.
@@ -1228,6 +1256,31 @@ mod tests {
         assert!(!playback_resumed(cap / 2, cap)); // połowa to jeszcze nie
         assert!(playback_resumed(cap * 3 / 4, cap)); // dokładnie próg
         assert!(playback_resumed(cap, cap)); // pusty
+    }
+
+    /// odtwarza incydent gen 838 (log 2026-08-28): bufor przekroczył
+    /// min_open_ms samą długością, ale VAD nie potwierdził jeszcze ani
+    /// jednego chunka mowy — dawniej to wystarczało do spekulacji, dziś nie.
+    #[test]
+    fn g1_dlugi_ale_niepotwierdzony_bufor_nie_spekuluje() {
+        let min_open_samples = 1_500 * VAD_RATE / 1000;
+        assert!(!should_speculate(min_open_samples, 0, 1_500, 500));
+        assert!(!should_speculate(min_open_samples * 2, 400, 1_500, 500));
+    }
+
+    #[test]
+    fn g2_oba_progi_spelnione_pozwalaja_spekulowac() {
+        let min_open_samples = 1_500 * VAD_RATE / 1000;
+        assert!(should_speculate(min_open_samples, 500, 1_500, 500));
+    }
+
+    #[test]
+    fn g3_potwierdzona_mowa_ale_za_krotki_bufor_nie_spekuluje() {
+        // odwrotny przypadek: dużo potwierdzonej mowy w bardzo świeżym
+        // segmencie (teoretyczny przy niskim CHUNK_MS) — pierwszy warunek
+        // dalej obowiązuje niezależnie od drugiego
+        let too_short = 1_000 * VAD_RATE / 1000;
+        assert!(!should_speculate(too_short, 10_000, 1_500, 500));
     }
 
     /// tempo nominalne: świeże zadanie, tłumaczenie mieszczące się w oryginale
